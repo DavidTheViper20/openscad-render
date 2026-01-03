@@ -11,226 +11,234 @@ const app = express();
 
 app.use(express.json({ limit: "20mb" }));
 
-// ===== Env =====
+// ===== Config =====
 const TOKEN = process.env.OPENSCAD_RENDER_TOKEN || "";
-const OPENSCAD_BIN = process.env.OPENSCAD_BIN || "openscad";
 const LIB_DIR = process.env.OPENSCAD_LIB_DIR || "/opt/openscad-libs";
-const TIMEOUT_MS = Number(process.env.OPENSCAD_TIMEOUT_MS || 120000);
-const MIN_VALID_STL_BYTES = Number(process.env.MIN_VALID_STL_BYTES || 200);
-const LIB_DB_PATH = path.join(LIB_DIR, "libraries.json");
+const LIB_DB_FILE = process.env.OPENSCAD_LIB_DB_FILE || path.join(LIB_DIR, "_installed.json");
 
-// ===== Helpers =====
+// Optional allowlist for security (comma-separated hostnames)
+// Default allows GitHub + codeload.
+const ALLOWED_HOSTS = (process.env.OPENSCAD_LIB_ALLOWED_HOSTS || "github.com,codeload.github.com")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
 function authOk(req) {
   if (!TOKEN) return true;
   const h = req.headers.authorization || "";
   return h === `Bearer ${TOKEN}`;
 }
 
-async function ensureLibDir() {
-  await fs.mkdir(LIB_DIR, { recursive: true });
-  try {
-    await fs.access(LIB_DB_PATH);
-  } catch {
-    await fs.writeFile(LIB_DB_PATH, JSON.stringify({ libraries: {} }, null, 2), "utf8");
-  }
+async function ensureDir(p) {
+  await fs.mkdir(p, { recursive: true });
 }
 
-async function readLibDb() {
-  await ensureLibDir();
-  const raw = await fs.readFile(LIB_DB_PATH, "utf8");
+async function readDb() {
   try {
-    return JSON.parse(raw);
+    const txt = await fs.readFile(LIB_DB_FILE, "utf8");
+    return JSON.parse(txt);
   } catch {
     return { libraries: {} };
   }
 }
 
-async function writeLibDb(db) {
-  await ensureLibDir();
-  const tmp = `${LIB_DB_PATH}.tmp`;
-  await fs.writeFile(tmp, JSON.stringify(db, null, 2), "utf8");
-  await fs.rename(tmp, LIB_DB_PATH);
+async function writeDb(db) {
+  await ensureDir(path.dirname(LIB_DB_FILE));
+  await fs.writeFile(LIB_DB_FILE, JSON.stringify(db, null, 2), "utf8");
 }
 
-function sha256(buf) {
+function sha256Hex(buf) {
   return crypto.createHash("sha256").update(buf).digest("hex");
 }
 
-function isProbablyJson(buf) {
-  const s = buf.slice(0, 2).toString("utf8");
-  return s.startsWith("{") || s.startsWith("[");
-}
-
-function resolveGitHubTarballUrl(repoUrl, ref) {
-  // repoUrl like: https://github.com/openscad/MCAD
-  // Use codeload, not github archive pages (more reliable).
-  const m = String(repoUrl).match(/^https?:\/\/github\.com\/([^/]+)\/([^/]+?)(?:\.git|\/)?$/i);
-  if (!m) return null;
-  const owner = m[1];
-  const repo = m[2];
-  const safeRef = ref || "master";
-  return `https://codeload.github.com/${owner}/${repo}/tar.gz/refs/heads/${safeRef}`;
-}
-
-async function downloadToBuffer(url) {
-  const resp = await fetch(url, { redirect: "follow" });
-  if (!resp.ok) {
-    throw new Error(`Download failed ${resp.status} from ${url}`);
-  }
-  const arr = new Uint8Array(await resp.arrayBuffer());
-  return Buffer.from(arr);
-}
-
-async function pathExists(p) {
+function urlHost(u) {
   try {
-    await fs.access(p);
-    return true;
+    return new URL(u).hostname;
   } catch {
-    return false;
+    return "";
   }
 }
 
-async function safeRm(p) {
+function assertAllowedUrl(u) {
+  const host = urlHost(u);
+  if (!host) throw new Error(`Invalid URL: ${u}`);
+  if (!ALLOWED_HOSTS.includes(host)) {
+    throw new Error(`URL host not allowed: ${host}. Allowed: ${ALLOWED_HOSTS.join(", ")}`);
+  }
+}
+
+// If user supplies https://github.com/org/repo, build codeload tarball URLs.
+// We try a few patterns for ref because branch/tag can differ.
+function expandGithubTarballUrls(repoUrl, ref) {
+  const m = repoUrl.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/?$/);
+  if (!m) return [repoUrl]; // not a plain repo URL, use as-is
+  const owner = m[1];
+  const repo = m[2].replace(/\.git$/, "");
+  const base = `https://codeload.github.com/${owner}/${repo}/tar.gz/`;
+
+  if (!ref || !ref.trim()) {
+    // No ref provided → GitHub default branch is unknown; user should set ref.
+    // Still try "master" then "main".
+    return [`${base}refs/heads/master`, `${base}refs/heads/main`];
+  }
+
+  const r = ref.trim();
+
+  // If they already passed a "refs/..." string, respect it.
+  if (r.startsWith("refs/")) return [`${base}${r}`];
+
+  // Try as branch, then tag, then raw ref (covers commits sometimes).
+  return [
+    `${base}refs/heads/${r}`,
+    `${base}refs/tags/${r}`,
+    `${base}${r}`,
+  ];
+}
+
+async function downloadFirstWorking(urls) {
+  let lastErr = "";
+  for (const u of urls) {
+    assertAllowedUrl(u);
+    const resp = await fetch(u, { redirect: "follow" });
+    if (!resp.ok) {
+      lastErr = `HTTP ${resp.status} from ${u}`;
+      continue;
+    }
+    const ab = await resp.arrayBuffer();
+    const buf = Buffer.from(ab);
+    return { usedUrl: u, buf };
+  }
+  throw new Error(`Download failed. Last error: ${lastErr}`);
+}
+
+async function listTopLevelDirs(dir) {
+  const entries = await fs.readdir(dir, { withFileTypes: true });
+  return entries.filter((e) => e.isDirectory()).map((e) => e.name);
+}
+
+async function rmForce(p) {
+  await fs.rm(p, { recursive: true, force: true });
+}
+
+async function moveDir(src, dst) {
+  await rmForce(dst);
   try {
-    await fs.rm(p, { recursive: true, force: true });
-  } catch {}
+    await fs.rename(src, dst);
+  } catch {
+    // cross-device fallback
+    await fs.cp(src, dst, { recursive: true });
+    await rmForce(src);
+  }
 }
 
-async function ensureSymlink(linkPath, targetPath) {
-  // Remove existing link/dir, then symlink.
-  await safeRm(linkPath);
-  await fs.symlink(targetPath, linkPath);
-}
+async function installLibrary(lib) {
+  // lib: {id, url, ref?, rootFolder?, sha256?, version?}
+  const { id, url, ref, rootFolder, sha256, version } = lib || {};
+  if (!id || typeof id !== "string") throw new Error("Library missing id");
+  if (!url || typeof url !== "string") throw new Error(`Library ${id} missing url`);
 
-async function extractTarGzToDir(tarGzPath, outDir) {
-  await fs.mkdir(outDir, { recursive: true });
-  // tar should exist on linux (Render)
-  await execFileAsync("tar", ["-xzf", tarGzPath, "-C", outDir], { timeout: 120000 });
-}
+  await ensureDir(LIB_DIR);
 
-async function inferRootFolder(extractDir) {
-  const items = await fs.readdir(extractDir, { withFileTypes: true });
-  const dirs = items.filter((d) => d.isDirectory()).map((d) => d.name);
-  if (dirs.length === 1) return dirs[0];
-  return null;
-}
+  const expanded = expandGithubTarballUrls(url, ref);
+  const { usedUrl, buf } = await downloadFirstWorking(expanded);
 
-let librarySyncLock = Promise.resolve();
-function withSyncLock(fn) {
-  const run = librarySyncLock.then(fn, fn);
-  librarySyncLock = run.then(() => {}, () => {});
-  return run;
+  const gotSha = sha256Hex(buf);
+  if (sha256 && String(sha256).trim() && gotSha !== String(sha256).trim().toLowerCase()) {
+    throw new Error(`SHA256 mismatch for ${id}. expected=${sha256} got=${gotSha}`);
+  }
+
+  const jobId = crypto.randomBytes(6).toString("hex");
+  const workDir = await fs.mkdtemp(path.join(os.tmpdir(), `lib-${jobId}-`));
+  const archivePath = path.join(workDir, "lib.tar.gz");
+  const extractDir = path.join(workDir, "extract");
+  await ensureDir(extractDir);
+
+  await fs.writeFile(archivePath, buf);
+
+  // Extract (tar is the simplest + reliable on linux hosts)
+  await execFileAsync("tar", ["-xzf", archivePath, "-C", extractDir], { timeout: 120000 });
+
+  // Choose root folder
+  let root = rootFolder && String(rootFolder).trim() ? String(rootFolder).trim() : null;
+  if (root) {
+    const p = path.join(extractDir, root);
+    try {
+      const st = await fs.stat(p);
+      if (!st.isDirectory()) throw new Error();
+    } catch {
+      throw new Error(`Could not find rootFolder "${root}" inside extracted archive`);
+    }
+  } else {
+    const tops = await listTopLevelDirs(extractDir);
+    if (tops.length === 1) root = tops[0];
+    else if (tops.length > 1) {
+      // pick the one most likely to be the project folder (heuristic)
+      root = tops.find((x) => x.toLowerCase().includes(id.toLowerCase())) || tops[0];
+    } else {
+      throw new Error("Archive extraction produced no top-level folders");
+    }
+  }
+
+  // Install into stable folder: LIB_DIR/id
+  const srcFolder = path.join(extractDir, root);
+  const dstFolder = path.join(LIB_DIR, id);
+
+  await moveDir(srcFolder, dstFolder);
+  await rmForce(workDir);
+
+  return {
+    id,
+    version: version || null,
+    url,
+    usedUrl,
+    sha256: gotSha,
+    rootFolder: root,
+    installedAt: new Date().toISOString(),
+    installPath: dstFolder,
+  };
 }
 
 // ===== Routes =====
-app.get("/health", async (_req, res) => {
-  await ensureLibDir();
-  res.status(200).send("ok");
-});
+app.get("/health", (_req, res) => res.status(200).send("ok"));
 
 app.get("/libraries", async (req, res) => {
-  if (!authOk(req)) return res.status(401).json({ ok: false, error: "Unauthorized" });
-  const db = await readLibDb();
-  return res.json({ ok: true, libraries: db.libraries || {} });
+  try {
+    if (!authOk(req)) return res.status(401).json({ ok: false, error: "Unauthorized" });
+    const db = await readDb();
+    res.json({ ok: true, db, libDir: LIB_DIR, allowedHosts: ALLOWED_HOSTS });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
 });
 
+// Sync/install libraries (call this from Base44 server-side)
 app.post("/libraries/sync", async (req, res) => {
   try {
     if (!authOk(req)) return res.status(401).json({ ok: false, error: "Unauthorized" });
-    await ensureLibDir();
 
-    const libs = req.body?.libraries;
-    if (!Array.isArray(libs) || libs.length === 0) {
-      return res.status(400).json({ ok: false, error: "Missing libraries[]" });
+    const { libraries } = req.body || {};
+    if (!Array.isArray(libraries) || libraries.length === 0) {
+      return res.status(400).json({ ok: false, error: "Body must include libraries: []" });
     }
 
-    const result = await withSyncLock(async () => {
-      const db = await readLibDb();
-      db.libraries ||= {};
+    const db = await readDb();
+    const installed = [];
 
-      const installed = [];
+    for (const lib of libraries) {
+      const meta = await installLibrary(lib);
+      db.libraries[meta.id] = meta;
+      installed.push(meta);
+    }
 
-      for (const lib of libs) {
-        const id = String(lib?.id || "").trim();
-        if (!id) throw new Error("Each library needs id");
+    await writeDb(db);
 
-        const url = String(lib?.url || "").trim();
-        if (!url) throw new Error(`Library ${id} missing url`);
-
-        const ref = String(lib?.ref || "").trim() || "master";
-
-        // Accept either a direct tarball URL, or a GitHub repo URL.
-        let usedUrl = url;
-        if (!/\.(tgz|tar\.gz)$/i.test(url)) {
-          const gh = resolveGitHubTarballUrl(url, ref);
-          if (!gh) throw new Error(`Library ${id}: url must be .tgz/.tar.gz or a GitHub repo URL`);
-          usedUrl = gh;
-        }
-
-        // Download
-        const tarBuf = await downloadToBuffer(usedUrl);
-        const tarHash = sha256(tarBuf);
-
-        // Extract into temp
-        const tmpExtract = path.join(LIB_DIR, `__extract_${id}_${Date.now()}_${crypto.randomBytes(3).toString("hex")}`);
-        await fs.mkdir(tmpExtract, { recursive: true });
-
-        const tarPath = path.join(tmpExtract, "lib.tar.gz");
-        await fs.writeFile(tarPath, tarBuf);
-
-        await extractTarGzToDir(tarPath, tmpExtract);
-
-        // Determine rootFolder inside extracted archive
-        const rootFolder = String(lib?.rootFolder || "").trim() || (await inferRootFolder(tmpExtract));
-        if (!rootFolder) {
-          await safeRm(tmpExtract);
-          throw new Error(`Could not infer rootFolder for ${id}. Provide rootFolder explicitly.`);
-        }
-
-        const rootPath = path.join(tmpExtract, rootFolder);
-        if (!(await pathExists(rootPath))) {
-          await safeRm(tmpExtract);
-          throw new Error(`Could not find rootFolder "${rootFolder}" inside extracted archive`);
-        }
-
-        // Move root folder into LIB_DIR as a versioned folder
-        // Keep the extracted folder name as-is (e.g. MCAD-master).
-        const finalRootPath = path.join(LIB_DIR, rootFolder);
-        await safeRm(finalRootPath);
-        await fs.rename(rootPath, finalRootPath);
-
-        // Clean temp
-        await safeRm(tmpExtract);
-
-        // Create stable alias so code can do: use <MCAD/...>
-        // Alias folder name is the library id.
-        const aliasPath = path.join(LIB_DIR, id);
-        await ensureSymlink(aliasPath, finalRootPath);
-
-        const meta = {
-          id,
-          version: lib?.version || null,
-          url,
-          usedUrl,
-          sha256: tarHash,
-          rootFolder,
-          installedAt: new Date().toISOString(),
-        };
-
-        db.libraries[id] = meta;
-        installed.push(meta);
-      }
-
-      await writeLibDb(db);
-      return { installed, db };
-    });
-
-    return res.json({ ok: true, ...result });
+    return res.json({ ok: true, installed, db });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
+// Render OpenSCAD code to STL
 app.post("/render", async (req, res) => {
   let dir = null;
   try {
@@ -244,8 +252,6 @@ app.post("/render", async (req, res) => {
       return res.status(400).json({ error: "Only format=stl is supported" });
     }
 
-    await ensureLibDir();
-
     const jobId = crypto.randomBytes(6).toString("hex");
     dir = await fs.mkdtemp(path.join(os.tmpdir(), `scad-${jobId}-`));
     const inFile = path.join(dir, "input.scad");
@@ -253,29 +259,33 @@ app.post("/render", async (req, res) => {
 
     await fs.writeFile(inFile, code, "utf8");
 
-    // IMPORTANT:
-    // - Do NOT pass --enable=manifold (your OpenSCAD doesn't support it)
-    // - Use OPENSCADPATH so: use <MCAD/...> works
+    // Ensure OpenSCAD can find libs
     const env = {
       ...process.env,
       OPENSCADPATH: LIB_DIR,
     };
 
-    // OpenSCAD CLI: openscad -o output.stl input.scad
-    await execFileAsync(OPENSCAD_BIN, ["-o", outFile, inFile], {
-      timeout: TIMEOUT_MS,
+    // Export binary STL (smaller, faster)
+    // If your OpenSCAD doesn't support binstl, change to "asciistl" or remove --export-format.
+    const args = ["--export-format", "binstl", "-o", outFile, inFile];
+
+    const { stdout, stderr } = await execFileAsync("openscad", args, {
+      timeout: 120000,
       env,
+      cwd: dir,
+      maxBuffer: 10 * 1024 * 1024,
     });
 
-    const stl = await fs.readFile(outFile);
-
-    // Guard: don’t return JSON disguised as STL
-    if (!stl || stl.length < MIN_VALID_STL_BYTES || isProbablyJson(stl)) {
+    // Validate output exists and isn't tiny
+    const st = await fs.stat(outFile);
+    if (!st || st.size < 200) {
       return res.status(500).json({
-        error: "STL export produced invalid/empty output. Check OpenSCAD code and library paths.",
-        details: `bytes=${stl?.length || 0}`,
+        error: "STL output was empty/suspiciously small",
+        details: { size: st?.size || 0, stdout, stderr },
       });
     }
+
+    const stl = await fs.readFile(outFile);
 
     res.setHeader("Content-Type", "application/sla");
     res.setHeader("Cache-Control", "no-store");
@@ -283,16 +293,14 @@ app.post("/render", async (req, res) => {
   } catch (e) {
     return res.status(500).json({ error: String(e?.message || e) });
   } finally {
-    if (dir) {
-      try { await fs.rm(dir, { recursive: true, force: true }); } catch {}
-    }
+    if (dir) await fs.rm(dir, { recursive: true, force: true });
   }
 });
 
-// ===== Start =====
 const port = process.env.PORT || 3000;
 app.listen(port, async () => {
-  await ensureLibDir();
+  await ensureDir(LIB_DIR);
   console.log(`OpenSCAD render service running on :${port}`);
   console.log(`LIB_DIR=${LIB_DIR}`);
+  console.log(`ALLOWED_HOSTS=${ALLOWED_HOSTS.join(",")}`);
 });
