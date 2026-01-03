@@ -1,318 +1,409 @@
 import express from "express";
-import fsp from "fs/promises";
-import fs from "fs";
+import fs from "fs/promises";
+import fssync from "fs";
 import path from "path";
 import os from "os";
 import crypto from "crypto";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import { pipeline } from "stream/promises";
-import { Readable, Transform } from "stream";
 
 const execFileAsync = promisify(execFile);
 const app = express();
 
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "25mb" }));
 
-// =====================
-// Auth
-// =====================
+// -------------------- CONFIG --------------------
 const TOKEN = process.env.OPENSCAD_RENDER_TOKEN || "";
+const LIB_DIR = process.env.OPENSCAD_LIB_DIR || "/opt/openscad-libs";
+const INSTALL_DB = path.join(LIB_DIR, ".installed.json");
+const DOWNLOAD_TIMEOUT_MS = Number(process.env.OPENSCAD_LIB_DOWNLOAD_TIMEOUT_MS || 120000);
+const OPENSCAD_TIMEOUT_MS = Number(process.env.OPENSCAD_TIMEOUT_MS || 120000);
+
+// If you want to restrict where downloads can come from:
+const ALLOWED_LIB_HOSTS = (process.env.OPENSCAD_ALLOWED_LIB_HOSTS || "github.com,codeload.github.com")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+// -------------------- AUTH --------------------
 function authOk(req) {
   if (!TOKEN) return true;
   const h = req.headers.authorization || "";
   return h === `Bearer ${TOKEN}`;
 }
-
-app.get("/health", (_req, res) => res.status(200).send("ok"));
-
-// =====================
-// Library install config
-// =====================
-
-// Where libraries are installed on the render server
-const LIB_DIR = process.env.OPENSCAD_LIB_DIR || "/opt/openscad-libs";
-
-// Optional: JSON manifest (recommended) so you can change libs without code changes.
-// Format example:
-// {
-//   "gears_mcad": {"version":"1.0.0","url":"https://.../mcad-1.0.0.tgz","sha256":"...","rootFolder":"MCAD"},
-//   "threads": {"version":"2.1.0","url":"https://.../threads-2.1.0.tgz","sha256":"...","rootFolder":"threads"}
-// }
-function loadManifest() {
-  const env = process.env.OPENSCAD_LIB_MANIFEST_JSON;
-  if (env && env.trim()) {
-    try {
-      return JSON.parse(env);
-    } catch (e) {
-      console.warn("OPENSCAD_LIB_MANIFEST_JSON is not valid JSON:", e?.message || e);
-    }
+function requireAuth(req, res) {
+  if (!authOk(req)) {
+    res.status(401).json({ error: "Unauthorized" });
+    return false;
   }
-
-  // Fallback example manifest (replace via env var in production)
-  return {
-    // Example only. Use OPENSCAD_LIB_MANIFEST_JSON for real values.
-    // gears_mcad: {
-    //   version: "1.0.0",
-    //   url: "https://your-cdn.com/openscad-libs/mcad-1.0.0.tgz",
-    //   sha256: "PUT_SHA256_HERE",
-    //   rootFolder: "MCAD"
-    // }
-  };
+  return true;
 }
 
-function normalizeLibs(libs) {
-  if (!libs) return [];
-  if (Array.isArray(libs)) return libs.map(String);
-  return [];
-}
-
+// -------------------- UTIL --------------------
 async function ensureDir(p) {
-  await fsp.mkdir(p, { recursive: true });
+  await fs.mkdir(p, { recursive: true });
 }
 
-function installedMetaPath(libId) {
-  return path.join(LIB_DIR, `${libId}.installed.json`);
-}
-
-function lockPath(libId) {
-  return path.join(LIB_DIR, `${libId}.lock`);
-}
-
-async function readInstalledMeta(libId) {
+async function fileExists(p) {
   try {
-    const raw = await fsp.readFile(installedMetaPath(libId), "utf8");
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
-}
-
-async function writeInstalledMeta(libId, meta) {
-  await fsp.writeFile(installedMetaPath(libId), JSON.stringify(meta, null, 2), "utf8");
-}
-
-async function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-async function withLibLock(libId, fn) {
-  await ensureDir(LIB_DIR);
-  const lp = lockPath(libId);
-
-  const deadline = Date.now() + 60_000; // 60s
-  while (true) {
-    try {
-      const handle = await fsp.open(lp, "wx");
-      try {
-        return await fn();
-      } finally {
-        await handle.close().catch(() => {});
-        await fsp.unlink(lp).catch(() => {});
-      }
-    } catch (e) {
-      if (e?.code !== "EEXIST") throw e;
-      if (Date.now() > deadline) throw new Error(`Timeout waiting for lock for ${libId}`);
-      await sleep(250 + Math.floor(Math.random() * 250));
-    }
-  }
-}
-
-async function downloadToFile(url, destPath, expectedSha256) {
-  const resp = await fetch(url, { redirect: "follow" });
-  if (!resp.ok) throw new Error(`Download failed ${resp.status} from ${url}`);
-
-  const hash = crypto.createHash("sha256");
-  const hasher = new Transform({
-    transform(chunk, _enc, cb) {
-      hash.update(chunk);
-      cb(null, chunk);
-    },
-  });
-
-  await pipeline(
-    Readable.fromWeb(resp.body),
-    hasher,
-    fs.createWriteStream(destPath)
-  );
-
-  const digest = hash.digest("hex");
-  if (expectedSha256 && expectedSha256 !== digest) {
-    throw new Error(`SHA256 mismatch. Expected ${expectedSha256}, got ${digest}`);
-  }
-  return digest;
-}
-
-async function extractArchive(archivePath, destDir) {
-  // Supports .tgz/.tar.gz via tar (recommended).
-  // Supports .zip via unzip if installed.
-  const lower = archivePath.toLowerCase();
-
-  await ensureDir(destDir);
-
-  if (lower.endsWith(".tgz") || lower.endsWith(".tar.gz")) {
-    await execFileAsync("tar", ["-xzf", archivePath, "-C", destDir], { timeout: 120000 });
-    return;
-  }
-
-  if (lower.endsWith(".zip")) {
-    // Requires `unzip` installed on the render server.
-    await execFileAsync("unzip", ["-q", archivePath, "-d", destDir], { timeout: 120000 });
-    return;
-  }
-
-  throw new Error(`Unsupported archive type for ${archivePath}. Use .tgz/.tar.gz (recommended) or .zip (requires unzip).`);
-}
-
-async function safeRemove(p) {
-  await fsp.rm(p, { recursive: true, force: true }).catch(() => {});
-}
-
-async function pathExists(p) {
-  try {
-    await fsp.stat(p);
+    await fs.stat(p);
     return true;
   } catch {
     return false;
   }
 }
 
-async function ensureLibraryInstalled(libId, { force = false } = {}) {
-  const manifest = loadManifest();
-  const spec = manifest[libId];
-  if (!spec) throw new Error(`Unknown library id: ${libId}`);
-  if (!spec.url || !spec.rootFolder) throw new Error(`Library ${libId} missing url/rootFolder in manifest`);
-
-  const targetFolder = path.join(LIB_DIR, spec.rootFolder);
-
-  return await withLibLock(libId, async () => {
-    await ensureDir(LIB_DIR);
-
-    const meta = await readInstalledMeta(libId);
-    const folderOk = await pathExists(targetFolder);
-
-    if (!force && meta && folderOk && meta.version === spec.version) {
-      return { libId, status: "already", version: meta.version, rootFolder: spec.rootFolder };
-    }
-
-    // Install / reinstall
-    const tmpBase = await fsp.mkdtemp(path.join(os.tmpdir(), `lib-${libId}-`));
-    const archivePath = path.join(tmpBase, "lib_archive");
-
-    try {
-      // Pick extension from URL so extractor knows what to do
-      const urlLower = spec.url.toLowerCase();
-      const ext =
-        urlLower.endsWith(".tar.gz") ? ".tar.gz" :
-        urlLower.endsWith(".tgz") ? ".tgz" :
-        urlLower.endsWith(".zip") ? ".zip" :
-        "";
-
-      const archiveWithExt = archivePath + ext;
-
-      const sha = await downloadToFile(spec.url, archiveWithExt, spec.sha256);
-
-      const extractedDir = path.join(tmpBase, "extracted");
-      await extractArchive(archiveWithExt, extractedDir);
-
-      const extractedRoot = path.join(extractedDir, spec.rootFolder);
-      if (!(await pathExists(extractedRoot))) {
-        // Helpful debug: list top-level dirs
-        const items = await fsp.readdir(extractedDir).catch(() => []);
-        throw new Error(
-          `Archive did not contain expected rootFolder "${spec.rootFolder}". Found: ${items.join(", ")}`
-        );
-      }
-
-      // Replace existing
-      await safeRemove(targetFolder);
-
-      // Copy to target (rename can fail across devices)
-      await fsp.cp(extractedRoot, targetFolder, { recursive: true });
-
-      await writeInstalledMeta(libId, {
-        libId,
-        version: spec.version,
-        rootFolder: spec.rootFolder,
-        sha256: sha,
-        installedAt: new Date().toISOString(),
-        sourceUrl: spec.url,
-      });
-
-      return { libId, status: "installed", version: spec.version, rootFolder: spec.rootFolder };
-    } finally {
-      await safeRemove(tmpBase);
-    }
-  });
+function sha256Buffer(buf) {
+  return crypto.createHash("sha256").update(buf).digest("hex");
 }
 
-// =====================
-// Library endpoints
-// =====================
+async function sha256File(filePath) {
+  const hash = crypto.createHash("sha256");
+  await new Promise((resolve, reject) => {
+    const s = fssync.createReadStream(filePath);
+    s.on("data", (d) => hash.update(d));
+    s.on("end", resolve);
+    s.on("error", reject);
+  });
+  return hash.digest("hex");
+}
 
-app.get("/libraries/status", async (req, res) => {
+function isProbablyGitHubRepoUrl(u) {
   try {
-    if (!authOk(req)) return res.status(401).json({ error: "Unauthorized" });
+    const url = new URL(u);
+    return url.hostname === "github.com" && url.pathname.split("/").filter(Boolean).length >= 2;
+  } catch {
+    return false;
+  }
+}
 
-    const manifest = loadManifest();
-    await ensureDir(LIB_DIR);
+function toGitHubTarballCandidates(repoUrl, ref) {
+  // Accept:
+  //  - https://github.com/org/repo
+  //  - https://github.com/org/repo/tree/<ref>
+  // Build candidates that usually work:
+  //  - https://codeload.github.com/org/repo/tar.gz/<ref>
+  //  - https://github.com/org/repo/archive/refs/heads/<ref>.tar.gz
+  // We’ll try main/master if ref not provided.
+  const u = new URL(repoUrl);
+  const parts = u.pathname.split("/").filter(Boolean);
+  const org = parts[0];
+  const repo = parts[1];
 
-    const result = {};
-    for (const [id, spec] of Object.entries(manifest)) {
-      const meta = await readInstalledMeta(id);
-      const folderOk = spec?.rootFolder ? await pathExists(path.join(LIB_DIR, spec.rootFolder)) : false;
-      result[id] = {
-        manifest: { version: spec.version, rootFolder: spec.rootFolder, hasUrl: !!spec.url },
-        installed: !!meta && folderOk,
-        installedMeta: meta || null,
-      };
+  let refGuess = ref;
+  // If URL includes /tree/<ref>
+  const treeIdx = parts.indexOf("tree");
+  if (!refGuess && treeIdx !== -1 && parts[treeIdx + 1]) refGuess = parts[treeIdx + 1];
+
+  const refsToTry = refGuess ? [refGuess] : ["main", "master", "HEAD"];
+
+  const candidates = [];
+  for (const r of refsToTry) {
+    candidates.push(`https://codeload.github.com/${org}/${repo}/tar.gz/${r}`);
+    if (r !== "HEAD") {
+      candidates.push(`https://github.com/${org}/${repo}/archive/refs/heads/${r}.tar.gz`);
+      candidates.push(`https://github.com/${org}/${repo}/archive/refs/tags/${r}.tar.gz`);
+    }
+  }
+  return candidates;
+}
+
+function assertAllowedHost(downloadUrl) {
+  const u = new URL(downloadUrl);
+  if (!ALLOWED_LIB_HOSTS.includes(u.hostname)) {
+    throw new Error(
+      `Library host not allowed: ${u.hostname}. Set OPENSCAD_ALLOWED_LIB_HOSTS to include it.`
+    );
+  }
+}
+
+// Download to file (streaming)
+async function downloadToFile(url, outFile) {
+  assertAllowedHost(url);
+
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
+
+  try {
+    const resp = await fetch(url, {
+      method: "GET",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "OpenSCAD-Render-LibSync/1.0",
+        "Accept": "application/octet-stream,*/*",
+      },
+    });
+
+    if (!resp.ok) {
+      throw new Error(`Download failed ${resp.status} from ${url}`);
+    }
+    await ensureDir(path.dirname(outFile));
+    const fileStream = fssync.createWriteStream(outFile);
+    await pipeline(resp.body, fileStream);
+    return { ok: true, url };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function extractTgz(archiveFile, extractDir) {
+  await ensureDir(extractDir);
+  // Use system tar (present on most Linux images incl. Render)
+  await execFileAsync("tar", ["-xzf", archiveFile, "-C", extractDir], { timeout: 120000 });
+}
+
+// Find a folder within extracted content that matches rootFolder
+async function resolveExtractedRoot(extractDir, rootFolder) {
+  const top = await fs.readdir(extractDir, { withFileTypes: true });
+  const topDirs = top.filter((d) => d.isDirectory()).map((d) => d.name);
+
+  if (rootFolder) {
+    // Common case: <repo>-<ref>/<rootFolder>
+    for (const td of topDirs) {
+      const candidate = path.join(extractDir, td, rootFolder);
+      if (await fileExists(candidate)) return candidate;
+    }
+    // Or rootFolder at top-level
+    const direct = path.join(extractDir, rootFolder);
+    if (await fileExists(direct)) return direct;
+
+    // Or it might be nested deeper; do a shallow search (2 levels)
+    for (const td of topDirs) {
+      const inner = await fs.readdir(path.join(extractDir, td), { withFileTypes: true });
+      for (const ent of inner) {
+        if (ent.isDirectory() && ent.name === rootFolder) {
+          return path.join(extractDir, td, ent.name);
+        }
+      }
     }
 
-    return res.json({ ok: true, libDir: LIB_DIR, status: result });
-  } catch (e) {
-    return res.status(500).json({ error: String(e?.message || e) });
+    throw new Error(`Could not find rootFolder "${rootFolder}" inside extracted archive`);
   }
+
+  // If no rootFolder specified:
+  // If only one top-level dir, use it
+  if (topDirs.length === 1) return path.join(extractDir, topDirs[0]);
+
+  // Otherwise: pick the first dir that contains .scad files (one level down)
+  for (const td of topDirs) {
+    const p = path.join(extractDir, td);
+    const inner = await fs.readdir(p, { withFileTypes: true });
+    if (inner.some((x) => x.isFile() && x.name.toLowerCase().endsWith(".scad"))) return p;
+  }
+
+  throw new Error("Could not determine library root folder automatically; please set rootFolder");
+}
+
+async function loadInstalled() {
+  try {
+    const txt = await fs.readFile(INSTALL_DB, "utf8");
+    return JSON.parse(txt);
+  } catch {
+    return { libraries: {} };
+  }
+}
+
+async function saveInstalled(db) {
+  await ensureDir(LIB_DIR);
+  await fs.writeFile(INSTALL_DB, JSON.stringify(db, null, 2), "utf8");
+}
+
+// Install/Update a library
+// Descriptor shape:
+// {
+//   id: "gears",
+//   version: "optional",
+//   url: "https://...tgz OR https://github.com/org/repo",
+//   ref: "main|master|tag (optional for github)",
+//   sha256: "optional",
+//   rootFolder: "MCAD" (optional but recommended for repo bundles)
+// }
+const installLocks = new Map();
+
+async function installLibrary(desc) {
+  if (!desc?.id) throw new Error("Library missing id");
+  if (!desc?.url) throw new Error(`Library ${desc.id} missing url`);
+
+  // Simple in-process lock to prevent concurrent installs of same lib
+  if (installLocks.has(desc.id)) return installLocks.get(desc.id);
+
+  const p = (async () => {
+    await ensureDir(LIB_DIR);
+    const db = await loadInstalled();
+    const existing = db.libraries?.[desc.id];
+
+    // If already installed with same version+sha256, skip
+    if (
+      existing &&
+      desc.version &&
+      existing.version === desc.version &&
+      (!desc.sha256 || existing.sha256 === desc.sha256)
+    ) {
+      return existing;
+    }
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), `lib-${desc.id}-`));
+    const archiveFile = path.join(tmpDir, "lib.tgz");
+    const extractDir = path.join(tmpDir, "extract");
+    const finalDir = path.join(LIB_DIR, desc.id);
+    const metaDir = path.join(finalDir, ".meta");
+
+    // Download (supports GitHub repo URL by converting to tarball URLs)
+    let usedUrl = desc.url;
+    if (isProbablyGitHubRepoUrl(desc.url) && !desc.url.toLowerCase().endsWith(".tgz") && !desc.url.toLowerCase().endsWith(".tar.gz")) {
+      const candidates = toGitHubTarballCandidates(desc.url, desc.ref);
+      let ok = false;
+      let lastErr = null;
+      for (const c of candidates) {
+        try {
+          await downloadToFile(c, archiveFile);
+          usedUrl = c;
+          ok = true;
+          break;
+        } catch (e) {
+          lastErr = e;
+        }
+      }
+      if (!ok) throw lastErr || new Error("Failed to download GitHub tarball");
+    } else {
+      await downloadToFile(desc.url, archiveFile);
+    }
+
+    // Verify sha if provided
+    const gotSha = await sha256File(archiveFile);
+    if (desc.sha256 && desc.sha256.toLowerCase() !== gotSha.toLowerCase()) {
+      throw new Error(`SHA256 mismatch for ${desc.id}. expected=${desc.sha256} got=${gotSha}`);
+    }
+
+    // Extract
+    await extractTgz(archiveFile, extractDir);
+    const rootPath = await resolveExtractedRoot(extractDir, desc.rootFolder);
+
+    // Replace install atomically-ish
+    await fs.rm(finalDir, { recursive: true, force: true });
+    await ensureDir(finalDir);
+    await fs.cp(rootPath, finalDir, { recursive: true });
+
+    // Write meta
+    await ensureDir(metaDir);
+    const meta = {
+      id: desc.id,
+      version: desc.version || null,
+      url: desc.url,
+      usedUrl,
+      sha256: gotSha,
+      rootFolder: desc.rootFolder || null,
+      installedAt: new Date().toISOString(),
+    };
+    await fs.writeFile(path.join(metaDir, "installed.json"), JSON.stringify(meta, null, 2), "utf8");
+
+    db.libraries = db.libraries || {};
+    db.libraries[desc.id] = meta;
+    await saveInstalled(db);
+
+    return meta;
+  })().finally(() => {
+    installLocks.delete(desc.id);
+  });
+
+  installLocks.set(desc.id, p);
+  return p;
+}
+
+async function ensureLibraries(libraries) {
+  // libraries can be:
+  // - ["gears","threads"] (must already be installed)
+  // - [{id,url,rootFolder,...}, ...] (will install/ensure)
+  const db = await loadInstalled();
+  const missing = [];
+
+  for (const lib of libraries || []) {
+    if (typeof lib === "string") {
+      if (!db.libraries?.[lib]) missing.push(lib);
+    } else if (lib && typeof lib === "object") {
+      await installLibrary(lib);
+    }
+  }
+
+  if (missing.length) {
+    throw new Error(
+      `Missing libraries on render server: ${missing.join(", ")}. Call POST /libraries/sync first or pass full descriptors.`
+    );
+  }
+}
+
+async function symlinkRequestedLibsIntoJob(jobDir, libraries) {
+  // For installed libs, we symlink jobDir/<something> so OpenSCAD finds `use <MCAD/...>` relative to input.scad dir.
+  // Strategy:
+  // - If the library has rootFolder, create jobDir/<rootFolder> -> LIB_DIR/<id>
+  // - Otherwise, create jobDir/<id> -> LIB_DIR/<id>
+  const db = await loadInstalled();
+
+  for (const lib of libraries || []) {
+    const id = typeof lib === "string" ? lib : lib.id;
+    if (!id) continue;
+    const meta = db.libraries?.[id];
+    if (!meta) continue;
+
+    // If they specified rootFolder, link that name (e.g. "MCAD") to the installed directory.
+    // Otherwise link by id.
+    const linkName = meta.rootFolder || id;
+    const linkPath = path.join(jobDir, linkName);
+
+    // Remove if exists
+    await fs.rm(linkPath, { recursive: true, force: true });
+    // Create symlink
+    await fs.symlink(path.join(LIB_DIR, id), linkPath, "dir");
+  }
+}
+
+// -------------------- ROUTES --------------------
+app.get("/health", async (_req, res) => {
+  await ensureDir(LIB_DIR);
+  res.status(200).send("ok");
 });
 
+// List installed libs
+app.get("/libraries", async (req, res) => {
+  if (!requireAuth(req, res)) return;
+  const db = await loadInstalled();
+  res.status(200).json(db);
+});
+
+// Sync/install libs
 app.post("/libraries/sync", async (req, res) => {
   try {
-    if (!authOk(req)) return res.status(401).json({ error: "Unauthorized" });
+    if (!requireAuth(req, res)) return;
 
-    const libs = normalizeLibs(req.body?.libs);
-    const force = !!req.body?.force;
-
-    if (!libs.length) {
-      return res.status(400).json({ error: "libs[] is required" });
+    const { libraries } = req.body || {};
+    if (!Array.isArray(libraries) || libraries.length === 0) {
+      return res.status(400).json({ error: "Body must include { libraries: [...] }" });
     }
 
-    const installed = [];
-    const already = [];
-    for (const id of libs) {
-      const r = await ensureLibraryInstalled(id, { force });
-      if (r.status === "installed") installed.push(id);
-      else already.push(id);
+    const results = [];
+    for (const lib of libraries) {
+      if (!lib?.id || !lib?.url) {
+        return res.status(400).json({ error: "Each library must include at least {id, url}" });
+      }
+      const meta = await installLibrary(lib);
+      results.push(meta);
     }
 
-    return res.json({ ok: true, installed, already });
+    const db = await loadInstalled();
+    return res.status(200).json({ ok: true, installed: results, db });
   } catch (e) {
-    return res.status(500).json({ error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-// =====================
-// Render endpoint
-// =====================
-
+// Render STL
 app.post("/render", async (req, res) => {
-  const jobId = crypto.randomBytes(6).toString("hex");
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), `scad-${jobId}-`));
-
   try {
-    if (!authOk(req)) return res.status(401).json({ error: "Unauthorized" });
+    if (!requireAuth(req, res)) return;
 
-    const { code, format } = req.body || {};
-    const libs = normalizeLibs(req.body?.libs);
-
+    const { code, format, libraries = [] } = req.body || {};
     if (typeof code !== "string" || !code.trim()) {
       return res.status(400).json({ error: "Missing code" });
     }
@@ -320,43 +411,39 @@ app.post("/render", async (req, res) => {
       return res.status(400).json({ error: "Only format=stl is supported" });
     }
 
-    // Ensure requested libs installed
-    if (libs.length) {
-      for (const id of libs) await ensureLibraryInstalled(id, { force: false });
-    }
+    // Ensure libraries are available (install if descriptors provided)
+    await ensureLibraries(libraries);
 
+    const jobId = crypto.randomBytes(6).toString("hex");
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), `scad-${jobId}-`));
     const inFile = path.join(dir, "input.scad");
     const outFile = path.join(dir, "output.stl");
 
-    await fsp.writeFile(inFile, code, "utf8");
+    // Make requested libraries available relative to input.scad
+    await symlinkRequestedLibsIntoJob(dir, libraries);
 
-    // Add library include path so SCAD can: use <MCAD/involute_gears.scad>;
-    // NOTE: -I adds a library search path.
-    const args = [];
-    args.push("-o", outFile);
+    await fs.writeFile(inFile, code, "utf8");
 
-    // Optional: enables manifold backend if installed OpenSCAD supports it
-    // (If your OpenSCAD build doesn't support, remove this line.)
-    args.push("--enable=manifold");
+    // Render
+    // You can add OpenSCAD flags here if you want:
+    // --enable=manifold can help robustness on some builds
+    await execFileAsync("openscad", ["-o", outFile, "--enable=manifold", inFile], {
+      timeout: OPENSCAD_TIMEOUT_MS,
+    });
 
-    // Library search path
-    args.push("-I", LIB_DIR);
-
-    args.push(inFile);
-
-    await execFileAsync("openscad", args, { timeout: 120000 });
-
-    const stl = await fsp.readFile(outFile);
+    const stl = await fs.readFile(outFile);
 
     res.setHeader("Content-Type", "application/sla");
     res.setHeader("Cache-Control", "no-store");
     return res.status(200).send(stl);
   } catch (e) {
     return res.status(500).json({ error: String(e?.message || e) });
-  } finally {
-    await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
   }
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`OpenSCAD render service running on :${port}`));
+app.listen(port, async () => {
+  await ensureDir(LIB_DIR);
+  console.log(`OpenSCAD render service running on :${port}`);
+  console.log(`LIB_DIR=${LIB_DIR}`);
+});
