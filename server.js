@@ -1,5 +1,6 @@
 import express from "express";
 import fs from "fs/promises";
+import fsSync from "fs";
 import path from "path";
 import os from "os";
 import crypto from "crypto";
@@ -9,857 +10,856 @@ import { promisify } from "util";
 const execFileAsync = promisify(execFile);
 const app = express();
 
-// IMPORTANT for cookies behind Render/HTTPS proxy
-app.set("trust proxy", 1);
+app.use(express.json({ limit: "15mb" }));
 
-app.use(express.json({ limit: "10mb" }));
-
-// =========================
-// Config
-// =========================
+/**
+ * ENV
+ */
 const TOKEN = process.env.OPENSCAD_RENDER_TOKEN || "";
+const PORT = Number(process.env.PORT || 3000);
 const OPENSCAD_BIN = process.env.OPENSCAD_BIN || "openscad";
-const OPENSCAD_TIMEOUT_MS = Number(process.env.OPENSCAD_TIMEOUT_MS || 120000);
 
+// Where libs + DB live
 const LIB_DIR = process.env.OPENSCAD_LIB_DIR || "/opt/openscad-libs";
-const ENABLED_DIR = path.join(LIB_DIR, "_enabled");
-const LIB_DB_PATH = process.env.OPENSCAD_LIB_DB_PATH || path.join(LIB_DIR, ".libdb.json");
+const ENABLED_DIR = path.join(LIB_DIR, "_enabled");     // symlinks used by OpenSCAD include path
+const INSTALL_DIR = path.join(LIB_DIR, "_installed");   // extracted archives
+const DB_PATH = process.env.OPENSCAD_LIB_DB || path.join(LIB_DIR, "libdb.json");
 
-const SERVICE_NAME = process.env.SERVICE_NAME || "OpenSCAD Render Service";
+// Limits
+const MAX_LIB_BYTES = Number(process.env.OPENSCAD_MAX_LIB_BYTES || 250 * 1024 * 1024); // 250MB
+const RENDER_TIMEOUT_MS = Number(process.env.OPENSCAD_RENDER_TIMEOUT_MS || 120000);
+const MAX_CONCURRENT_RENDERS = Number(process.env.OPENSCAD_MAX_CONCURRENT || 2);
 
-// =========================
-// Cookie auth helpers
-// =========================
-function parseCookies(req) {
-  const header = req.headers.cookie || "";
-  const out = {};
-  header.split(";").forEach((part) => {
-    const [k, ...rest] = part.trim().split("=");
-    if (!k) return;
-    out[k] = decodeURIComponent(rest.join("=") || "");
+// Optional CORS (only if you need browser calls from your Base44 frontend directly)
+const CORS_ORIGIN = process.env.CORS_ORIGIN || "";
+
+/**
+ * Basic CORS (optional)
+ */
+if (CORS_ORIGIN) {
+  app.use((req, res, next) => {
+    res.setHeader("Access-Control-Allow-Origin", CORS_ORIGIN);
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+    if (req.method === "OPTIONS") return res.status(204).end();
+    next();
   });
-  return out;
 }
 
-function cookieAuthOk(req) {
-  if (!TOKEN) return true;
-  const c = parseCookies(req);
-  return c.os_token === TOKEN;
-}
-
-function bearerAuthOk(req) {
-  if (!TOKEN) return true;
+/**
+ * Auth helpers
+ */
+function getTokenFromReq(req) {
   const h = req.headers.authorization || "";
-  return h === `Bearer ${TOKEN}`;
+  if (h.startsWith("Bearer ")) return h.slice("Bearer ".length).trim();
+  if (req.query && typeof req.query.token === "string") return req.query.token.trim();
+  return "";
 }
-
-// For dashboard GET routes (browser loads): allow cookie or ?token or bearer
-function dashboardAuthOk(req) {
+function authOk(req) {
   if (!TOKEN) return true;
-  if (cookieAuthOk(req)) return true;
-  if (bearerAuthOk(req)) return true;
-  if ((req.query?.token || "") === TOKEN) return true; // optional fallback
-  return false;
+  return getTokenFromReq(req) === TOKEN;
 }
-
-// For POST routes: require bearer (keep these protected from browser CSRF)
-function apiAuthOk(req) {
-  return bearerAuthOk(req);
-}
-
-// =========================
-// Utils
-// =========================
-function escapeHtml(s) {
-  return String(s ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
-}
-
-async function exists(p) {
-  try { await fs.stat(p); return true; } catch { return false; }
-}
-
-async function ensureDir(p) {
-  await fs.mkdir(p, { recursive: true });
-}
-
-async function rmrf(p) {
-  await fs.rm(p, { recursive: true, force: true });
-}
-
-// Node 16+ fs.cp exists; otherwise fallback copy
-async function copyDir(src, dest) {
-  await ensureDir(path.dirname(dest));
-  if (typeof fs.cp === "function") {
-    await fs.cp(src, dest, { recursive: true });
-    return;
+function requireAuth(req, res, next) {
+  if (!authOk(req)) {
+    return res
+      .status(401)
+      .send("Unauthorized\n\nOpen /?token=YOUR_TOKEN or send an Authorization header.");
   }
-  const entries = await fs.readdir(src, { withFileTypes: true });
-  await ensureDir(dest);
-  for (const e of entries) {
-    const from = path.join(src, e.name);
-    const to = path.join(dest, e.name);
-    if (e.isDirectory()) await copyDir(from, to);
-    else await fs.copyFile(from, to);
-  }
+  next();
 }
 
-async function sha256Hex(buf) {
-  const { createHash } = await import("crypto");
-  return createHash("sha256").update(buf).digest("hex");
-}
-
-// =========================
-// Live log + SSE
-// =========================
-const MAX_LOG = 300;
-const logBuffer = [];
+/**
+ * Logging + SSE
+ */
+const LOG_RING_MAX = 500;
+const logRing = [];
 const sseClients = new Set();
 
-function pushLog(type, message, data = null) {
-  const entry = { ts: new Date().toISOString(), type, message, data };
-  logBuffer.push(entry);
-  while (logBuffer.length > MAX_LOG) logBuffer.shift();
+function pushLog(tag, message, meta = null) {
+  const line = {
+    ts: new Date().toISOString(),
+    tag,
+    message,
+    meta,
+  };
+  logRing.push(line);
+  if (logRing.length > LOG_RING_MAX) logRing.shift();
 
-  const payload = `event: log\ndata: ${JSON.stringify(entry)}\n\n`;
+  // broadcast to SSE clients
+  const payload = `event: log\ndata: ${JSON.stringify(line)}\n\n`;
   for (const res of sseClients) {
-    try { res.write(payload); } catch {}
+    try { res.write(payload); } catch (_) {}
   }
 }
 
-function pushState(db) {
+function pushStateUpdate(db) {
   const payload = `event: state\ndata: ${JSON.stringify({ ts: new Date().toISOString(), db })}\n\n`;
   for (const res of sseClients) {
-    try { res.write(payload); } catch {}
+    try { res.write(payload); } catch (_) {}
   }
 }
 
-// =========================
-// Library DB
-// =========================
-async function readLibDb() {
+/**
+ * DB
+ */
+let db = { libraries: {} };
+
+async function ensureDirs() {
+  await fs.mkdir(LIB_DIR, { recursive: true });
+  await fs.mkdir(ENABLED_DIR, { recursive: true });
+  await fs.mkdir(INSTALL_DIR, { recursive: true });
+}
+
+async function loadDb() {
   try {
-    const raw = await fs.readFile(LIB_DB_PATH, "utf8");
-    const db = JSON.parse(raw);
-    if (!db || typeof db !== "object") throw new Error("Invalid DB");
-    if (!db.libraries) db.libraries = {};
-    return db;
-  } catch {
-    return { libraries: {} };
+    const txt = await fs.readFile(DB_PATH, "utf8");
+    db = JSON.parse(txt);
+    if (!db || typeof db !== "object") db = { libraries: {} };
+    if (!db.libraries || typeof db.libraries !== "object") db.libraries = {};
+  } catch (_) {
+    db = { libraries: {} };
   }
 }
 
-async function writeLibDb(db) {
-  await ensureDir(path.dirname(LIB_DB_PATH));
-  await fs.writeFile(LIB_DB_PATH, JSON.stringify(db, null, 2), "utf8");
+async function saveDb() {
+  await fs.writeFile(DB_PATH, JSON.stringify(db, null, 2), "utf8");
 }
 
-async function rebuildEnabledDir() {
-  await ensureDir(LIB_DIR);
-  await rmrf(ENABLED_DIR);
-  await ensureDir(ENABLED_DIR);
+/**
+ * Symlink enabled libs into ENABLED_DIR/<id> so users can:
+ *   use <MCAD/involute_gears.scad>;
+ */
+async function rebuildEnabledSymlinks() {
+  await fs.mkdir(ENABLED_DIR, { recursive: true });
 
-  const db = await readLibDb();
-  const libs = Object.values(db.libraries || {});
-  for (const l of libs) {
-    const enabled = (l.enabled !== false);
-    if (!enabled) continue;
+  // remove existing symlinks/dirs in ENABLED_DIR
+  const entries = await fs.readdir(ENABLED_DIR).catch(() => []);
+  for (const e of entries) {
+    await fs.rm(path.join(ENABLED_DIR, e), { recursive: true, force: true }).catch(() => {});
+  }
 
-    const src = path.join(LIB_DIR, l.id);
-    const dest = path.join(ENABLED_DIR, l.id);
-    if (!(await exists(src))) continue;
-
-    // Prefer symlink; fall back to copy
+  for (const [id, lib] of Object.entries(db.libraries)) {
+    if (!lib.enabled) continue;
+    if (!lib.installPath) continue;
+    const linkPath = path.join(ENABLED_DIR, id);
     try {
-      await fs.symlink(src, dest, "dir");
-    } catch {
-      await copyDir(src, dest);
+      await fs.symlink(lib.installPath, linkPath, "junction");
+    } catch (e) {
+      pushLog("library.symlink.err", `Failed to symlink ${id}`, { error: String(e?.message || e) });
+      db.libraries[id].lastError = `Symlink failed: ${String(e?.message || e)}`;
     }
   }
+  await saveDb();
 }
 
-// =========================
-// Download + extract
-// =========================
-function isGithubRepoUrl(u) {
+/**
+ * Download helpers
+ */
+function isLikelyGitHubRepoUrl(url) {
   try {
-    const url = new URL(u);
-    return url.hostname === "github.com";
+    const u = new URL(url);
+    return u.hostname === "github.com" && u.pathname.split("/").filter(Boolean).length >= 2;
   } catch {
     return false;
   }
 }
 
-function parseGithubOwnerRepo(u) {
-  const url = new URL(u);
-  const parts = url.pathname.replace(/^\/+/, "").split("/");
+function parseGitHubOwnerRepo(url) {
+  const u = new URL(url);
+  const parts = u.pathname.split("/").filter(Boolean);
   const owner = parts[0];
-  const repo = (parts[1] || "").replace(/\.git$/, "");
-  if (!owner || !repo) return null;
+  let repo = parts[1] || "";
+  repo = repo.replace(/\.git$/i, "");
   return { owner, repo };
 }
 
-async function githubCodeloadUrl(repoUrl, ref) {
-  const pr = parseGithubOwnerRepo(repoUrl);
-  if (!pr) throw new Error("Invalid GitHub repo URL");
-  const { owner, repo } = pr;
+function pickGitHubArchiveUrl(repoUrl, ref) {
+  const { owner, repo } = parseGitHubOwnerRepo(repoUrl);
 
-  // try heads first, then tags
-  const headUrl = `https://codeload.github.com/${owner}/${repo}/tar.gz/refs/heads/${encodeURIComponent(ref)}`;
-  const tagUrl  = `https://codeload.github.com/${owner}/${repo}/tar.gz/refs/tags/${encodeURIComponent(ref)}`;
-
-  const r1 = await fetch(headUrl, { method: "HEAD" });
-  if (r1.ok) return headUrl;
-
-  const r2 = await fetch(tagUrl, { method: "HEAD" });
-  if (r2.ok) return tagUrl;
-
-  return headUrl;
+  // Try heads first; if it 404s we’ll retry as tags during download.
+  const r = (ref && String(ref).trim()) ? String(ref).trim() : "master";
+  const heads = `https://codeload.github.com/${owner}/${repo}/tar.gz/refs/heads/${encodeURIComponent(r)}`;
+  const tags  = `https://codeload.github.com/${owner}/${repo}/tar.gz/refs/tags/${encodeURIComponent(r)}`;
+  return { heads, tags, ref: r };
 }
 
-async function downloadToBuffer(url) {
+async function downloadToFile(url, outPath) {
   const resp = await fetch(url, { redirect: "follow" });
-  if (!resp.ok) throw new Error(`Download failed ${resp.status} from ${url}`);
-  const ab = await resp.arrayBuffer();
-  return Buffer.from(ab);
+  if (!resp.ok) {
+    throw new Error(`Download failed ${resp.status} from ${url}`);
+  }
+  const contentLength = Number(resp.headers.get("content-length") || "0");
+  if (contentLength && contentLength > MAX_LIB_BYTES) {
+    throw new Error(`Download too large (${contentLength} bytes)`);
+  }
+
+  const arr = new Uint8Array(await resp.arrayBuffer());
+  if (arr.byteLength > MAX_LIB_BYTES) {
+    throw new Error(`Download too large (${arr.byteLength} bytes)`);
+  }
+
+  await fs.writeFile(outPath, arr);
+  return arr.byteLength;
 }
 
-async function extractTarGz(archivePath, destDir) {
-  await ensureDir(destDir);
+async function sha256File(filePath) {
+  const buf = await fs.readFile(filePath);
+  return crypto.createHash("sha256").update(buf).digest("hex");
+}
+
+async function tarTopFolder(archivePath) {
+  const { stdout } = await execFileAsync("tar", ["-tzf", archivePath], { timeout: 60000 });
+  const lines = stdout.split("\n").map(s => s.trim()).filter(Boolean);
+  if (!lines.length) throw new Error("Archive appears empty");
+  const first = lines[0];
+  const top = first.split("/")[0];
+  return top;
+}
+
+async function tarExtract(archivePath, destDir) {
+  await fs.mkdir(destDir, { recursive: true });
   await execFileAsync("tar", ["-xzf", archivePath, "-C", destDir], { timeout: 120000 });
 }
 
-async function listTopLevelDirs(dir) {
-  const entries = await fs.readdir(dir, { withFileTypes: true });
-  return entries.filter((e) => e.isDirectory()).map((e) => e.name);
-}
+/**
+ * Install/Update one library
+ */
+async function installLibrary(spec) {
+  const id = String(spec.id || "").trim();
+  if (!id) throw new Error("Library missing id");
 
-async function installOneLibrary(lib) {
-  const {
-    id,
-    url,
-    ref = null,
-    rootFolder = null,
-    version = null,
-    sha256 = null,
-    enabled = true,
+  const url = String(spec.url || "").trim();
+  if (!url) throw new Error(`Library ${id} missing url`);
 
-    // optional fields for your “admin-like” UI
-    name = null,
-    description = null,
-    keywords = null
-  } = lib || {};
+  const enabled = (spec.enabled === undefined) ? true : !!spec.enabled;
+  const ref = spec.ref ? String(spec.ref).trim() : null;
+  const rootFolderOverride = spec.rootFolder ? String(spec.rootFolder).trim() : null;
+  const expectedSha = spec.sha256 ? String(spec.sha256).trim().toLowerCase() : null;
 
-  if (!id || typeof id !== "string") throw new Error("Library missing id");
-  if (!url || typeof url !== "string") throw new Error(`Library ${id} missing url`);
-
-  await ensureDir(LIB_DIR);
-
+  // Determine actual download URL
   let usedUrl = url;
-  if (isGithubRepoUrl(url)) {
-    const refToUse = ref || "master";
-    usedUrl = await githubCodeloadUrl(url, refToUse);
-  }
+  let tagFallbackUrl = null;
 
-  pushLog("library.download.start", `Downloading ${id}`, { usedUrl });
-
-  const buf = await downloadToBuffer(usedUrl);
-  const gotSha = await sha256Hex(buf);
-
-  if (sha256 && String(sha256).toLowerCase() !== gotSha.toLowerCase()) {
-    throw new Error(`SHA256 mismatch for ${id}. expected=${sha256} got=${gotSha}`);
+  if (isLikelyGitHubRepoUrl(url)) {
+    const { heads, tags, ref: r } = pickGitHubArchiveUrl(url, ref);
+    usedUrl = heads;
+    tagFallbackUrl = tags;
+    pushLog("library.download.start", `Downloading ${id}`, { usedUrl, ref: r });
+  } else {
+    pushLog("library.download.start", `Downloading ${id}`, { usedUrl });
   }
 
   const jobId = crypto.randomBytes(6).toString("hex");
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), `lib-${id}-${jobId}-`));
-  const archivePath = path.join(tmpDir, "lib.tar.gz");
-  const extractDir = path.join(tmpDir, "extract");
+  const archivePath = path.join(tmpDir, `${id}.tar.gz`);
 
-  await fs.writeFile(archivePath, buf);
-  await extractTarGz(archivePath, extractDir);
+  let downloadedFrom = usedUrl;
+  try {
+    try {
+      await downloadToFile(usedUrl, archivePath);
+    } catch (e) {
+      // If it was a GitHub repo and heads failed, try tags automatically
+      if (tagFallbackUrl) {
+        pushLog("library.download.retry", `Retrying ${id} as tag`, { usedUrl: tagFallbackUrl });
+        await downloadToFile(tagFallbackUrl, archivePath);
+        downloadedFrom = tagFallbackUrl;
+      } else {
+        throw e;
+      }
+    }
 
-  let rf = rootFolder;
-  if (!rf) {
-    const tops = await listTopLevelDirs(extractDir);
-    if (tops.length === 1) rf = tops[0];
+    const actualSha = await sha256File(archivePath);
+    if (expectedSha && expectedSha !== actualSha) {
+      throw new Error(`SHA256 mismatch for ${id}. Expected ${expectedSha}, got ${actualSha}`);
+    }
+
+    // Figure out root folder
+    const topFolder = await tarTopFolder(archivePath);
+    const rootFolder = rootFolderOverride || topFolder;
+
+    // Verify rootFolder exists in archive listing (cheap check)
+    // (we’ll just ensure it matches top folder or is within it)
+    if (rootFolderOverride && rootFolderOverride !== topFolder) {
+      // allow nested, but must start with topFolder
+      if (!rootFolderOverride.startsWith(topFolder)) {
+        throw new Error(`Could not find rootFolder "${rootFolderOverride}" inside extracted archive (top folder is "${topFolder}")`);
+      }
+    }
+
+    // Extract into INSTALL_DIR/<id>/<sha>/
+    const libBase = path.join(INSTALL_DIR, id, actualSha);
+    await fs.rm(libBase, { recursive: true, force: true }).catch(() => {});
+    await fs.mkdir(libBase, { recursive: true });
+
+    await tarExtract(archivePath, libBase);
+
+    const installPath = path.join(libBase, rootFolder);
+    if (!fsSync.existsSync(installPath)) {
+      throw new Error(`Install path not found after extract: ${installPath}`);
+    }
+
+    const now = new Date().toISOString();
+
+    db.libraries[id] = {
+      id,
+      url,
+      usedUrl: downloadedFrom,
+      ref: ref || null,
+      version: spec.version ? String(spec.version) : null,
+      rootFolder,
+      sha256: actualSha,
+      enabled,
+      name: spec.name ? String(spec.name) : (db.libraries[id]?.name ?? null),
+      description: spec.description ? String(spec.description) : (db.libraries[id]?.description ?? null),
+      keywords: Array.isArray(spec.keywords) ? spec.keywords : (db.libraries[id]?.keywords ?? null),
+      installPath,
+      installedAt: db.libraries[id]?.installedAt || now,
+      updatedAt: now,
+      lastError: null,
+    };
+
+    pushLog("library.install.ok", `Installed ${id}`, { enabled, rootFolder, sha256: actualSha });
+    await saveDb();
+    await rebuildEnabledSymlinks();
+    pushStateUpdate(db);
+
+    return db.libraries[id];
+  } catch (e) {
+    const msg = String(e?.message || e);
+    pushLog("library.install.err", `Failed ${id}`, { error: msg });
+
+    const now = new Date().toISOString();
+    db.libraries[id] = {
+      ...(db.libraries[id] || { id }),
+      id,
+      url,
+      usedUrl,
+      ref: ref || null,
+      version: spec.version ? String(spec.version) : (db.libraries[id]?.version ?? null),
+      enabled,
+      updatedAt: now,
+      lastError: msg,
+    };
+    await saveDb();
+    pushStateUpdate(db);
+
+    throw e;
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
-  if (!rf) {
-    const tops = await listTopLevelDirs(extractDir);
-    throw new Error(`Could not auto-detect rootFolder. Top-level dirs: ${tops.join(", ") || "(none)"}`);
-  }
-
-  const rfPath = path.join(extractDir, rf);
-  if (!(await exists(rfPath))) {
-    throw new Error(`Could not find rootFolder "${rf}" inside extracted archive`);
-  }
-
-  const dest = path.join(LIB_DIR, id);
-  await rmrf(dest);
-  await copyDir(rfPath, dest);
-
-  const db = await readLibDb();
-  const now = new Date().toISOString();
-
-  db.libraries[id] = {
-    // required core
-    id,
-    url,
-    usedUrl,
-    ref: ref || null,
-    version,
-    rootFolder: rf,
-    sha256: gotSha,
-    enabled: enabled !== false,
-
-    // admin-ish metadata (optional)
-    name: name || db.libraries[id]?.name || null,
-    description: description || db.libraries[id]?.description || null,
-    keywords: Array.isArray(keywords) ? keywords : (db.libraries[id]?.keywords || null),
-
-    installedAt: db.libraries[id]?.installedAt || now,
-    updatedAt: now,
-    lastError: null
-  };
-
-  await writeLibDb(db);
-  await rebuildEnabledDir();
-  await rmrf(tmpDir);
-
-  pushLog("library.install.ok", `Installed ${id}`, { enabled: db.libraries[id].enabled, rootFolder: rf });
-  pushState(db);
-
-  return db.libraries[id];
 }
 
-async function removeLibraries(ids) {
-  const db = await readLibDb();
-  const removed = [];
-
-  for (const id of ids) {
-    if (!id) continue;
-    await rmrf(path.join(LIB_DIR, id));
-    delete db.libraries[id];
-    removed.push(id);
-    pushLog("library.remove", `Removed ${id}`, { id });
-  }
-
-  await writeLibDb(db);
-  await rebuildEnabledDir();
-  pushState(db);
-
-  return removed;
-}
-
+/**
+ * Enable/Disable/Delete helpers
+ */
 async function setEnabled(id, enabled) {
-  const db = await readLibDb();
-  if (!db.libraries[id]) {
-    db.libraries[id] = { id };
-  }
-  db.libraries[id].enabled = enabled === true;
+  if (!db.libraries[id]) throw new Error(`Library not found: ${id}`);
+  db.libraries[id].enabled = !!enabled;
   db.libraries[id].updatedAt = new Date().toISOString();
-  await writeLibDb(db);
-  await rebuildEnabledDir();
-  pushLog("library.toggle", `${enabled ? "Enabled" : "Disabled"} ${id}`, { id, enabled });
-  pushState(db);
+  db.libraries[id].lastError = null;
+  await saveDb();
+  await rebuildEnabledSymlinks();
+  pushLog("library.enabled", `${enabled ? "Enabled" : "Disabled"} ${id}`);
+  pushStateUpdate(db);
   return db.libraries[id];
 }
+async function deleteLibrary(id) {
+  const lib = db.libraries[id];
+  if (!lib) return;
+  delete db.libraries[id];
+  await saveDb();
 
-// =========================
-// Routes
-// =========================
+  // remove enabled link and installed files
+  await fs.rm(path.join(ENABLED_DIR, id), { recursive: true, force: true }).catch(() => {});
+  await fs.rm(path.join(INSTALL_DIR, id), { recursive: true, force: true }).catch(() => {});
+  pushLog("library.delete", `Deleted ${id}`);
+  pushStateUpdate(db);
+}
+
+/**
+ * Simple render concurrency limiter
+ */
+let inFlight = 0;
+const waiters = [];
+async function acquireRenderSlot() {
+  if (inFlight < MAX_CONCURRENT_RENDERS) {
+    inFlight += 1;
+    return;
+  }
+  await new Promise(resolve => waiters.push(resolve));
+  inFlight += 1;
+}
+function releaseRenderSlot() {
+  inFlight = Math.max(0, inFlight - 1);
+  const next = waiters.shift();
+  if (next) next();
+}
+
+/**
+ * Routes
+ */
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
-// Root -> dashboard
-app.get("/", (req, res) => res.redirect("/libraries"));
-
-// Login page (sets cookie)
-app.get("/login", (req, res) => {
-  const html = `<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>${escapeHtml(SERVICE_NAME)} - Login</title>
-  <style>
-    :root { color-scheme: dark; }
-    body { margin:0; font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial; background:#0b1020; color:#e5e7eb; }
-    .wrap { max-width: 520px; margin: 0 auto; padding: 18px; }
-    .card { background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12);
-            border-radius: 14px; padding: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
-    h1 { font-size: 18px; margin: 0 0 8px; }
-    p { color:#94a3b8; font-size: 13px; line-height: 1.4; margin: 0 0 12px; }
-    input { width: 100%; padding: 12px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.14);
-            background: rgba(0,0,0,0.25); color: #e5e7eb; font-size: 14px; }
-    button { margin-top: 10px; width: 100%; background:#6366f1; border:none; color:white;
-             padding:12px; border-radius: 12px; font-weight: 800; cursor:pointer; }
-    .muted { margin-top: 10px; font-size: 12px; color:#94a3b8; }
-    code { color:#a5b4fc; }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="card">
-      <h1>${escapeHtml(SERVICE_NAME)} — Dashboard Login</h1>
-      <p>Enter your <code>OPENSCAD_RENDER_TOKEN</code> once. We store it in a secure cookie so you can view the live dashboard without URL tokens.</p>
-      <form method="POST" action="/login">
-        <input name="token" type="password" placeholder="Render token" autocomplete="current-password" />
-        <button type="submit">Sign in</button>
-      </form>
-      <div class="muted">If you don’t set <code>OPENSCAD_RENDER_TOKEN</code>, login is not required.</div>
-    </div>
-  </div>
-</body>
-</html>`;
-  res.type("html").send(html);
-});
-
-// need urlencoded for login
-app.use(express.urlencoded({ extended: false }));
-
-app.post("/login", (req, res) => {
-  if (!TOKEN) return res.redirect("/libraries");
-  const t = (req.body?.token || "").trim();
-  if (t !== TOKEN) {
-    return res.status(401).type("html").send(`<p style="font-family:system-ui;color:#fff;background:#0b1020;padding:20px">
-      Wrong token. <a href="/login" style="color:#a5b4fc">Try again</a>.
-    </p>`);
-  }
-
-  const isSecure = req.secure || (req.headers["x-forwarded-proto"] === "https");
-  const cookie = [
-    `os_token=${encodeURIComponent(TOKEN)}`,
-    "Path=/",
-    "HttpOnly",
-    "SameSite=Lax",
-    isSecure ? "Secure" : ""
-  ].filter(Boolean).join("; ");
-
-  res.setHeader("Set-Cookie", cookie);
-  pushLog("dashboard.login", "Dashboard login success");
-  res.redirect("/libraries");
-});
-
-app.get("/logout", (_req, res) => {
-  res.setHeader("Set-Cookie", "os_token=; Path=/; Max-Age=0; SameSite=Lax");
-  res.redirect("/login");
-});
-
-// SSE live updates
-app.get("/events", async (req, res) => {
-  if (!dashboardAuthOk(req)) return res.status(401).end("Unauthorized");
-
-  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-  res.setHeader("Cache-Control", "no-cache, no-transform");
+/**
+ * SSE events for dashboard
+ */
+app.get("/events", requireAuth, (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders?.();
 
-  sseClients.add(res);
-
-  const db = await readLibDb();
+  // initial state + logs
   res.write(`event: state\ndata: ${JSON.stringify({ ts: new Date().toISOString(), db })}\n\n`);
-  for (const entry of logBuffer.slice(-60)) {
-    res.write(`event: log\ndata: ${JSON.stringify(entry)}\n\n`);
+  for (const l of logRing) {
+    res.write(`event: log\ndata: ${JSON.stringify(l)}\n\n`);
   }
 
-  const ping = setInterval(() => {
-    try { res.write(`event: ping\ndata: ${Date.now()}\n\n`); } catch {}
-  }, 15000);
-
-  req.on("close", () => {
-    clearInterval(ping);
-    sseClients.delete(res);
-  });
+  sseClients.add(res);
+  req.on("close", () => sseClients.delete(res));
 });
 
-// Render STL
-app.post("/render", async (req, res) => {
-  let dir = null;
-  const started = Date.now();
-  try {
-    if (!apiAuthOk(req)) return res.status(401).json({ error: "Unauthorized" });
-
-    const { code, format } = req.body || {};
-    if (typeof code !== "string" || !code.trim()) return res.status(400).json({ error: "Missing code" });
-    if ((format || "stl") !== "stl") return res.status(400).json({ error: "Only format=stl is supported" });
-
-    pushLog("render.start", "Render requested", { bytes: code.length });
-
-    const jobId = crypto.randomBytes(6).toString("hex");
-    dir = await fs.mkdtemp(path.join(os.tmpdir(), `scad-${jobId}-`));
-    const inFile = path.join(dir, "input.scad");
-    const outFile = path.join(dir, "output.stl");
-    await fs.writeFile(inFile, code, "utf8");
-
-    // IMPORTANT: only enabled libs
-    const env = { ...process.env };
-    const existing = env.OPENSCADPATH || "";
-    env.OPENSCADPATH = existing
-      ? `${ENABLED_DIR}${path.delimiter}${existing}`
-      : `${ENABLED_DIR}`;
-
-    await execFileAsync(
-      OPENSCAD_BIN,
-      ["-o", outFile, inFile],
-      { timeout: OPENSCAD_TIMEOUT_MS, env }
-    );
-
-    const stl = await fs.readFile(outFile);
-    pushLog("render.ok", "Render completed", { ms: Date.now() - started, bytes: stl.length });
-
-    res.setHeader("Content-Type", "application/sla");
-    res.setHeader("Cache-Control", "no-store");
-    return res.status(200).send(stl);
-  } catch (e) {
-    const msg =
-      e?.stderr?.toString?.() ||
-      e?.stdout?.toString?.() ||
-      e?.message ||
-      String(e);
-
-    pushLog("render.err", "Render failed", { error: msg });
-    return res.status(500).json({ error: msg });
-  } finally {
-    if (dir) await rmrf(dir);
-  }
+/**
+ * Return installed libs (server truth)
+ */
+app.get("/libraries", requireAuth, async (_req, res) => {
+  const libs = Object.values(db.libraries || {});
+  res.json({ ok: true, libraries: libs });
 });
 
-// Sync libraries (install/update + optional remove)
-app.post("/libraries/sync", async (req, res) => {
+/**
+ * Install/update libs.
+ * Body:
+ * { libraries: [{id,url,ref,rootFolder,sha256,version,enabled,name,description,keywords}], removeMissing?: boolean }
+ */
+app.post("/libraries/sync", requireAuth, async (req, res) => {
   try {
-    if (!apiAuthOk(req)) return res.status(401).json({ ok: false, error: "Unauthorized" });
+    const libraries = Array.isArray(req.body?.libraries) ? req.body.libraries : [];
+    const removeMissing = !!req.body?.removeMissing;
 
-    const { libraries, removeIds } = req.body || {};
-    pushLog("sync.start", "Library sync request", {
-      librariesCount: Array.isArray(libraries) ? libraries.length : 0,
-      removeCount: Array.isArray(removeIds) ? removeIds.length : 0
-    });
+    pushLog("sync.start", "Library sync request", { librariesCount: libraries.length, removeMissing });
 
     const installed = [];
     const errors = [];
 
-    if (Array.isArray(removeIds) && removeIds.length) {
-      await removeLibraries(removeIds);
+    const incomingIds = new Set(libraries.map(l => String(l?.id || "").trim()).filter(Boolean));
+
+    for (const spec of libraries) {
+      try {
+        const lib = await installLibrary(spec);
+        installed.push(lib);
+      } catch (e) {
+        errors.push({ id: spec?.id, error: String(e?.message || e) });
+      }
     }
 
-    if (Array.isArray(libraries)) {
-      for (const lib of libraries) {
-        try {
-          const rec = await installOneLibrary(lib);
-          installed.push(rec);
-        } catch (err) {
-          const id = lib?.id || "(unknown)";
-          const message = String(err?.message || err);
-
-          const db = await readLibDb();
-          db.libraries[id] = {
-            ...(db.libraries[id] || {}),
-            id,
-            url: lib?.url || db.libraries[id]?.url || null,
-            ref: lib?.ref ?? db.libraries[id]?.ref ?? null,
-            enabled: lib?.enabled ?? db.libraries[id]?.enabled ?? true,
-            name: lib?.name ?? db.libraries[id]?.name ?? null,
-            description: lib?.description ?? db.libraries[id]?.description ?? null,
-            keywords: Array.isArray(lib?.keywords) ? lib.keywords : (db.libraries[id]?.keywords ?? null),
-            updatedAt: new Date().toISOString(),
-            lastError: message
-          };
-          await writeLibDb(db);
-          await rebuildEnabledDir();
-          pushLog("library.install.err", `Failed ${id}`, { error: message });
-          pushState(db);
-
-          errors.push({ id, error: message });
+    if (removeMissing) {
+      // disable anything not in incoming list
+      for (const id of Object.keys(db.libraries)) {
+        if (!incomingIds.has(id)) {
+          await setEnabled(id, false).catch(() => {});
         }
       }
     }
 
-    const db = await readLibDb();
     pushLog("sync.done", "Library sync finished", { ok: errors.length === 0, installed: installed.length, errors: errors.length });
-    pushState(db);
+    pushStateUpdate(db);
 
-    return res.json({ ok: errors.length === 0, installed, errors, db });
+    res.json({ ok: errors.length === 0, installed, errors, db });
   } catch (e) {
-    pushLog("sync.err", "Library sync crashed", { error: String(e?.message || e) });
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    pushLog("sync.err", "Library sync failed", { error: String(e?.message || e) });
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-// Toggle enable/disable
-app.post("/libraries/toggle", async (req, res) => {
+app.post("/libraries/:id/enable", requireAuth, async (req, res) => {
   try {
-    if (!apiAuthOk(req)) return res.status(401).json({ ok: false, error: "Unauthorized" });
-    const { id, enabled } = req.body || {};
-    if (!id) return res.status(400).json({ ok: false, error: "Missing id" });
-
-    const rec = await setEnabled(id, enabled === true);
-    const db = await readLibDb();
-    return res.json({ ok: true, library: rec, db });
+    const lib = await setEnabled(req.params.id, true);
+    res.json({ ok: true, library: lib });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    res.status(400).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-// Remove libraries
-app.post("/libraries/remove", async (req, res) => {
+app.post("/libraries/:id/disable", requireAuth, async (req, res) => {
   try {
-    if (!apiAuthOk(req)) return res.status(401).json({ ok: false, error: "Unauthorized" });
-    const { ids } = req.body || {};
-    if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ ok: false, error: "Body must include ids: []" });
-
-    const removed = await removeLibraries(ids);
-    const db = await readLibDb();
-    return res.json({ ok: true, removed, db });
+    const lib = await setEnabled(req.params.id, false);
+    res.json({ ok: true, library: lib });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    res.status(400).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-// Status JSON (dashboard fetch uses cookie auth)
-app.get("/libraries/status", async (req, res) => {
+app.delete("/libraries/:id", requireAuth, async (req, res) => {
   try {
-    if (!dashboardAuthOk(req)) return res.status(401).json({ ok: false, error: "Unauthorized" });
-
-    const db = await readLibDb();
-    const libs = Object.values(db.libraries || {}).sort((a, b) =>
-      String(a.id || "").localeCompare(String(b.id || ""))
-    );
-
-    return res.json({
-      ok: true,
-      count: libs.length,
-      libDir: LIB_DIR,
-      enabledDir: ENABLED_DIR,
-      dbPath: LIB_DB_PATH,
-      libraries: libs,
-      recentLogs: logBuffer.slice(-80)
-    });
+    await deleteLibrary(req.params.id);
+    res.json({ ok: true });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    res.status(400).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-// Dashboard HTML (admin-like cards + search + live log)
-app.get("/libraries", async (req, res) => {
-  if (!dashboardAuthOk(req)) return res.redirect("/login");
+/**
+ * Render endpoint
+ * Body: { code: "...", format: "stl" }
+ */
+app.post("/render", requireAuth, async (req, res) => {
+  await acquireRenderSlot();
+  const start = Date.now();
 
-  res.type("html").send(`<!doctype html>
+  try {
+    const { code, format } = req.body || {};
+    if (typeof code !== "string" || !code.trim()) {
+      return res.status(400).json({ error: "Missing code" });
+    }
+    if ((format || "stl") !== "stl") {
+      return res.status(400).json({ error: "Only format=stl is supported" });
+    }
+
+    pushLog("render.start", "Render requested", { bytes: Buffer.byteLength(code, "utf8") });
+
+    const jobId = crypto.randomBytes(6).toString("hex");
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), `scad-${jobId}-`));
+    const inFile = path.join(dir, "input.scad");
+    const outFile = path.join(dir, "output.stl");
+
+    await fs.writeFile(inFile, code, "utf8");
+
+    // IMPORTANT: No --enable=manifold (your OpenSCAD doesn’t support it)
+    // Provide library include path via OPENSCADPATH pointing at ENABLED_DIR which contains symlinks:
+    //   ENABLED_DIR/MCAD -> .../MCAD-master
+    // so user can `use <MCAD/involute_gears.scad>;`
+    const env = {
+      ...process.env,
+      OPENSCADPATH: ENABLED_DIR,
+    };
+
+    // Use binstl to keep STL smaller and faster
+    const args = [
+      "-o", outFile,
+      "--export-format", "binstl",
+      inFile
+    ];
+
+    let stdout = "";
+    let stderr = "";
+    try {
+      const r = await execFileAsync(OPENSCAD_BIN, args, { timeout: RENDER_TIMEOUT_MS, env });
+      stdout = r.stdout || "";
+      stderr = r.stderr || "";
+    } catch (e) {
+      stdout = e?.stdout || "";
+      stderr = e?.stderr || "";
+      // Return stderr so you can see why OpenSCAD failed (missing module, include path, syntax, etc.)
+      const errMsg = `OpenSCAD failed.\n\nSTDERR:\n${stderr}\n\nSTDOUT:\n${stdout}`;
+      pushLog("render.err", "Render failed", { error: errMsg.slice(0, 2000) });
+      return res.status(500).json({ error: errMsg });
+    }
+
+    const stl = await fs.readFile(outFile);
+    const ms = Date.now() - start;
+
+    pushLog("render.ok", "Render completed", { ms, bytes: stl.length });
+
+    res.setHeader("Content-Type", "application/sla");
+    res.setHeader("Cache-Control", "no-store");
+    return res.status(200).send(stl);
+  } finally {
+    releaseRenderSlot();
+  }
+});
+
+/**
+ * Dashboard UI (root)
+ */
+app.get("/", requireAuth, async (_req, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!doctype html>
 <html>
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>${escapeHtml(SERVICE_NAME)} - Libraries</title>
-  <style>
-    :root { color-scheme: dark; }
-    body { margin:0; font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial; background:#0b1020; color:#e5e7eb; }
-    .wrap { max-width: 1100px; margin: 0 auto; padding: 16px; }
-    .top { display:flex; align-items:center; justify-content:space-between; gap: 12px; flex-wrap:wrap; }
-    h1 { font-size: 22px; margin: 0; letter-spacing: 0.2px; }
-    .sub { color:#94a3b8; font-size: 13px; margin-top: 4px; }
-    .btn { background:#6366f1; border:none; color:white; padding:10px 12px; border-radius: 10px; font-weight: 800; cursor:pointer; }
-    .btn.secondary { background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.14); }
-    .row { display:flex; gap: 12px; align-items:center; flex-wrap:wrap; margin-top: 14px; }
-    .search { flex: 1; min-width: 220px; }
-    input[type="search"] { width:100%; padding: 12px 12px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.14);
-                          background: rgba(0,0,0,0.25); color:#e5e7eb; font-size: 14px; }
-    .grid { display:grid; grid-template-columns: 1.6fr 1fr; gap: 14px; margin-top: 14px; }
-    .panel { background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12);
-             border-radius: 14px; padding: 14px; box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
-    .card { background: rgba(255,255,255,0.06); border: 1px solid rgba(99,102,241,0.35);
-            border-radius: 16px; padding: 14px; margin-bottom: 12px; }
-    .cardTop { display:flex; justify-content:space-between; gap: 10px; align-items:flex-start; }
-    .title { display:flex; gap: 10px; align-items:flex-start; }
-    .icon { width: 28px; height: 28px; border-radius: 10px; background: rgba(99,102,241,0.18);
-            border: 1px solid rgba(99,102,241,0.35); display:flex; align-items:center; justify-content:center; }
-    .name { font-weight: 900; font-size: 16px; }
-    .desc { color:#cbd5e1; font-size: 13px; margin-top: 2px; line-height: 1.3; }
-    .badge { padding: 4px 10px; border-radius: 999px; font-weight: 900; font-size: 12px; }
-    .badge.ok { background: rgba(52,211,153,0.16); border: 1px solid rgba(52,211,153,0.35); color:#34d399; }
-    .badge.off { background: rgba(251,113,133,0.14); border: 1px solid rgba(251,113,133,0.35); color:#fb7185; }
-    .meta { margin-top: 10px; display:grid; gap: 6px; }
-    .label { color:#94a3b8; font-size: 12px; }
-    .chips { display:flex; flex-wrap:wrap; gap: 6px; margin-top: 6px; }
-    .chip { font-size: 12px; color:#cbd5e1; background: rgba(255,255,255,0.06);
-            border:1px solid rgba(255,255,255,0.10); padding: 3px 8px; border-radius: 999px; }
-    .url { word-break: break-all; color:#94a3b8; font-size: 12px; margin-top: 6px; }
-    .err { margin-top: 8px; color:#fb7185; font-size: 12px; }
-    .log { height: 520px; overflow:auto; border-radius: 12px; border:1px solid rgba(255,255,255,0.12); background: rgba(0,0,0,0.25); padding: 10px; }
-    .logline { font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New"; font-size: 12px; margin: 0 0 8px; line-height: 1.35; }
-    .ts { color:#a7f3d0; }
-    .ty { color:#93c5fd; }
-    .live { color:#a5b4fc; font-size: 12px; }
-    @media (max-width: 940px) { .grid { grid-template-columns: 1fr; } .log { height: 320px; } }
-  </style>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>OpenSCAD Render Service — Library Monitor</title>
+<style>
+  :root{
+    --bg:#0b0b16; --panel:#151528; --panel2:#111125;
+    --border:#27274a; --text:#eaeaff; --muted:#a7a7c7;
+    --good:#2dd4bf; --bad:#fb7185; --chip:#1d1d36;
+    --accent:#7c3aed;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;
+    font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+    background: radial-gradient(1200px 600px at 10% 10%, #1b1440 0%, rgba(27,20,64,0) 60%),
+                radial-gradient(900px 500px at 90% 20%, #23123b 0%, rgba(35,18,59,0) 55%),
+                var(--bg);
+    color:var(--text);
+  }
+  header{
+    padding:22px 26px 10px;
+    display:flex; align-items:center; justify-content:space-between;
+    gap:12px;
+  }
+  h1{margin:0; font-size:22px; letter-spacing:.2px}
+  .sub{color:var(--muted); font-size:13px; margin-top:4px}
+  .topRight{display:flex; gap:10px; align-items:center}
+  .pill{padding:7px 10px; background:rgba(255,255,255,.06); border:1px solid var(--border); border-radius:999px; color:var(--muted); font-size:12px}
+  .btn{
+    cursor:pointer;
+    padding:10px 12px;
+    border-radius:10px;
+    border:1px solid var(--border);
+    background:rgba(255,255,255,.06);
+    color:var(--text);
+    font-weight:600;
+  }
+  .btn.primary{background:linear-gradient(135deg, var(--accent), #5b21b6); border-color:transparent}
+  .wrap{padding:0 26px 26px}
+  .searchRow{display:flex; gap:12px; align-items:center; margin:10px 0 14px}
+  input{
+    width:100%;
+    padding:12px 14px;
+    border-radius:12px;
+    border:1px solid var(--border);
+    background:rgba(0,0,0,.25);
+    color:var(--text);
+    outline:none;
+  }
+  .grid{
+    display:grid;
+    grid-template-columns: 360px 1fr;
+    gap:14px;
+  }
+  @media (max-width: 980px){
+    .grid{grid-template-columns:1fr}
+  }
+  .panel{
+    background:linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.03));
+    border:1px solid var(--border);
+    border-radius:16px;
+    overflow:hidden;
+  }
+  .panelHead{
+    padding:12px 14px;
+    border-bottom:1px solid var(--border);
+    display:flex; justify-content:space-between; align-items:center;
+  }
+  .panelTitle{font-weight:800}
+  .count{color:var(--muted); font-size:12px}
+  .list{padding:12px; display:flex; flex-direction:column; gap:10px; max-height:60vh; overflow:auto}
+  .card{
+    border:1px solid var(--border);
+    border-radius:14px;
+    padding:12px;
+    background:rgba(0,0,0,.18);
+  }
+  .row{display:flex; justify-content:space-between; gap:10px; align-items:center}
+  .id{font-weight:900; letter-spacing:.3px}
+  .tag{
+    font-size:12px;
+    padding:4px 10px;
+    border-radius:999px;
+    border:1px solid var(--border);
+    background:rgba(255,255,255,.06);
+  }
+  .tag.good{border-color:rgba(45,212,191,.35); color:var(--good)}
+  .tag.bad{border-color:rgba(251,113,133,.35); color:var(--bad)}
+  .url{color:var(--muted); font-size:12px; word-break:break-all; margin-top:8px}
+  .meta{display:flex; gap:8px; flex-wrap:wrap; margin-top:10px}
+  .chip{background:rgba(255,255,255,.05); border:1px solid var(--border); padding:4px 8px; border-radius:999px; font-size:12px; color:var(--muted)}
+  .logs{
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New";
+    font-size:12px;
+    padding:12px;
+    max-height:60vh;
+    overflow:auto;
+    white-space:pre-wrap;
+  }
+  .logline{margin:0 0 8px}
+  .logts{color:#86efac}
+  .logtag{color:#93c5fd}
+  .logmsg{color:#eaeaff}
+  .logmeta{color:var(--muted)}
+</style>
 </head>
 <body>
-  <div class="wrap">
-    <div class="top">
-      <div>
-        <h1>${escapeHtml(SERVICE_NAME)} — Library Monitor</h1>
-        <div class="sub">Live view of installed/enabled libraries + sync/render logs.</div>
-      </div>
-      <div style="display:flex; gap:10px; align-items:center;">
-        <span class="live" id="live">Live: connecting…</span>
-        <button class="btn secondary" onclick="location.href='/logout'">Logout</button>
-        <button class="btn" onclick="refresh()">Refresh</button>
-      </div>
-    </div>
+<header>
+  <div>
+    <h1>OpenSCAD Render Service — Library Monitor</h1>
+    <div class="sub">Live view of installed/enabled libraries + sync/render logs.</div>
+  </div>
+  <div class="topRight">
+    <div class="pill" id="livePill">Live: connecting…</div>
+    <button class="btn" onclick="logout()">Logout</button>
+    <button class="btn primary" onclick="refreshState()">Refresh</button>
+  </div>
+</header>
 
-    <div class="row">
-      <div class="search"><input id="q" type="search" placeholder="Search libraries…" oninput="render()" /></div>
-      <div class="live" id="count">Loading…</div>
-    </div>
-
-    <div class="grid">
-      <div class="panel">
-        <div id="cards"></div>
-      </div>
-
-      <div class="panel">
-        <div class="label" style="margin-bottom:8px">Live Logs (updates when server receives POSTs)</div>
-        <div class="log" id="log"></div>
-      </div>
-    </div>
+<div class="wrap">
+  <div class="searchRow">
+    <input id="search" placeholder="Search libraries…" oninput="render()" />
+    <div class="count" id="count">0 of 0 libraries</div>
   </div>
 
-<script>
-  const statusUrl = "/libraries/status";
-  const eventsUrl = "/events";
-  let db = null;
+  <div class="grid">
+    <div class="panel">
+      <div class="panelHead">
+        <div class="panelTitle">Libraries</div>
+        <div class="count" id="libCountSmall">—</div>
+      </div>
+      <div class="list" id="libs"></div>
+    </div>
 
-  function esc(s){ return String(s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#039;"); }
-  function fmtDate(s){ if(!s) return "—"; const d=new Date(s); return isNaN(d)? String(s) : d.toLocaleString(); }
+    <div class="panel">
+      <div class="panelHead">
+        <div class="panelTitle">Live Logs <span class="count">(updates when server receives POSTs)</span></div>
+      </div>
+      <div class="logs" id="logs"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const token = new URLSearchParams(location.search).get("token");
+  function logout(){
+    // simplest: drop query token
+    location.href = "/?token=";
+  }
+  function authedUrl(p){
+    const u = new URL(p, location.origin);
+    if (token) u.searchParams.set("token", token);
+    return u.toString();
+  }
+
+  let state = { libraries: {} };
+  let logs = [];
+
+  function fmtDate(iso){
+    if(!iso) return "—";
+    try { return new Date(iso).toLocaleString(); } catch { return iso; }
+  }
 
   function render(){
-    if(!db){ return; }
-    const q = (document.getElementById("q").value || "").toLowerCase().trim();
-    const libs = Object.values(db.libraries || {}).sort((a,b)=>String(a.id||"").localeCompare(String(b.id||"")));
+    const q = (document.getElementById("search").value || "").toLowerCase().trim();
+    const libsEl = document.getElementById("libs");
+    libsEl.innerHTML = "";
 
-    const filtered = libs.filter(l => {
-      const hay = [
-        l.id, l.name, l.description,
-        Array.isArray(l.keywords) ? l.keywords.join(" ") : ""
-      ].join(" ").toLowerCase();
+    const all = Object.values(state.libraries || {});
+    const filtered = all.filter(l => {
+      const hay = (l.id + " " + (l.name||"") + " " + (l.description||"") + " " + (l.url||"") + " " + (l.usedUrl||"")).toLowerCase();
       return !q || hay.includes(q);
     });
 
-    document.getElementById("count").textContent = filtered.length + " of " + libs.length + " libraries";
+    document.getElementById("count").textContent = filtered.length + " of " + all.length + " libraries";
+    document.getElementById("libCountSmall").textContent = all.length + " total";
 
-    const cards = filtered.map(l => {
-      const enabled = (l.enabled !== false);
-      const title = l.name || l.id;
-      const desc = l.description || "—";
-      const kws = Array.isArray(l.keywords) ? l.keywords : [];
-      const last = l.updatedAt || l.installedAt;
-      const url = l.usedUrl || l.url || "—";
-      const err = l.lastError ? ('<div class="err">Last error: ' + esc(l.lastError) + '</div>') : "";
+    if(!filtered.length){
+      libsEl.innerHTML = '<div class="card" style="color:var(--muted)">No libraries found.</div>';
+      return;
+    }
 
-      return \`
-        <div class="card">
-          <div class="cardTop">
-            <div class="title">
-              <div class="icon">⬢</div>
-              <div>
-                <div class="name">\${esc(title)}</div>
-                <div class="desc">\${esc(desc)}</div>
-                <div class="url">\${esc(url)}</div>
-              </div>
-            </div>
-            <div>
-              <span class="badge \${enabled ? "ok" : "off"}">\${enabled ? "Enabled" : "Disabled"}</span>
-            </div>
-          </div>
+    for(const l of filtered){
+      const enabled = !!l.enabled;
+      const ok = enabled && !l.lastError;
+      const statusClass = ok ? "good" : "bad";
+      const statusText = enabled ? (l.lastError ? "Error" : "Enabled") : "Disabled";
 
-          <div class="meta">
-            <div class="label">Keywords:</div>
-            <div class="chips">
-              \${kws.length ? kws.map(k => '<span class="chip">'+esc(k)+'</span>').join("") : '<span class="chip">—</span>'}
-            </div>
-            <div class="label" style="margin-top:8px">Last Sync: \${esc(fmtDate(last))}</div>
-            \${err}
-          </div>
+      const keywords = Array.isArray(l.keywords) ? l.keywords : [];
+      const kwChips = keywords.slice(0, 8).map(k => '<span class="chip">'+k+'</span>').join("");
+
+      const err = l.lastError ? ('<div class="url" style="color:var(--bad);margin-top:10px">Last error: '+escapeHtml(l.lastError)+'</div>') : "";
+
+      const card = document.createElement("div");
+      card.className = "card";
+      card.innerHTML = \`
+        <div class="row">
+          <div class="id">\${escapeHtml(l.id)}</div>
+          <div class="tag \${statusClass}">\${statusText}</div>
         </div>
+        <div class="url">\${escapeHtml(l.usedUrl || l.url || "")}</div>
+        <div class="meta">
+          <span class="chip">Root: \${escapeHtml(l.rootFolder || "—")}</span>
+          <span class="chip">SHA: \${escapeHtml((l.sha256||"").slice(0,10) || "—")}</span>
+          <span class="chip">Last Sync: \${escapeHtml(fmtDate(l.updatedAt || l.installedAt))}</span>
+        </div>
+        \${kwChips ? ('<div class="meta" style="margin-top:8px">'+kwChips+'</div>') : ""}
+        \${err}
       \`;
-    }).join("");
-
-    document.getElementById("cards").innerHTML = cards || '<div class="label">No libraries found.</div>';
+      libsEl.appendChild(card);
+    }
   }
 
-  function appendLog(entry){
-    const el = document.getElementById("log");
-    const line = document.createElement("div");
-    line.className = "logline";
-    line.innerHTML =
-      '<span class="ts">' + esc(entry.ts) + '</span> ' +
-      '<span class="ty">[' + esc(entry.type) + ']</span> ' +
-      esc(entry.message) +
-      (entry.data ? (' <span style="color:#94a3b8">' + esc(JSON.stringify(entry.data)) + '</span>') : '');
-    el.appendChild(line);
+  function renderLogs(){
+    const el = document.getElementById("logs");
+    el.innerHTML = logs.map(l => {
+      const meta = l.meta ? " " + escapeHtml(JSON.stringify(l.meta)) : "";
+      return '<div class="logline"><span class="logts">'+escapeHtml(l.ts)+'</span> <span class="logtag">['+escapeHtml(l.tag)+']</span> <span class="logmsg">'+escapeHtml(l.message)+'</span><span class="logmeta">'+meta+'</span></div>';
+    }).join("");
     el.scrollTop = el.scrollHeight;
   }
 
-  async function refresh(){
-    const res = await fetch(statusUrl, { cache:"no-store", credentials:"same-origin" });
-    const data = await res.json();
-    if(!data.ok){
-      document.getElementById("cards").innerHTML = '<div class="err">Failed: ' + esc(data.error || "Unknown") + '</div>';
-      return;
-    }
-    db = { libraries: Object.fromEntries((data.libraries||[]).map(l => [l.id, l])) };
-    render();
+  function escapeHtml(s){
+    return String(s||"").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;', "'":'&#39;'}[c]));
+  }
 
-    // preload logs once
-    const logEl = document.getElementById("log");
-    if(logEl.children.length === 0 && (data.recentLogs||[]).length){
-      for(const e of data.recentLogs) appendLog(e);
+  async function refreshState(){
+    const r = await fetch(authedUrl("/libraries"));
+    const j = await r.json();
+    if(j && j.ok){
+      state = { libraries: Object.fromEntries((j.libraries||[]).map(l => [l.id, l])) };
+      render();
     }
   }
 
-  function connectSse(){
-    const live = document.getElementById("live");
-    try{
-      const es = new EventSource(eventsUrl);
-      live.textContent = "Live: connected";
+  // SSE
+  const livePill = document.getElementById("livePill");
+  const ev = new EventSource(authedUrl("/events"));
+  ev.addEventListener("open", () => { livePill.textContent = "Live: connected"; });
+  ev.addEventListener("error", () => { livePill.textContent = "Live: disconnected"; });
 
-      es.addEventListener("state", (ev) => {
-        const payload = JSON.parse(ev.data);
-        db = payload.db;
-        render();
-      });
+  ev.addEventListener("state", (e) => {
+    try {
+      const payload = JSON.parse(e.data);
+      state = payload.db || state;
+      render();
+    } catch {}
+  });
 
-      es.addEventListener("log", (ev) => {
-        appendLog(JSON.parse(ev.data));
-      });
+  ev.addEventListener("log", (e) => {
+    try {
+      const line = JSON.parse(e.data);
+      logs.push(line);
+      if (logs.length > 400) logs.shift();
+      renderLogs();
+    } catch {}
+  });
 
-      es.addEventListener("error", () => {
-        live.textContent = "Live: disconnected (retrying…)";
-      });
-      return es;
-    }catch(e){
-      live.textContent = "Live: unavailable (polling)";
-      return null;
-    }
-  }
-
-  refresh();
-  connectSse();
-  setInterval(refresh, 12000);
+  // initial pull
+  refreshState().then(() => renderLogs());
 </script>
 </body>
 </html>`);
 });
 
-// =========================
-// Boot
-// =========================
-const port = process.env.PORT || 3000;
-app.listen(port, async () => {
-  await ensureDir(LIB_DIR);
-  await rebuildEnabledDir();
-  pushLog("server.start", "Server started", { port, LIB_DIR, ENABLED_DIR, DB: LIB_DB_PATH });
-  console.log(`${SERVICE_NAME} running on :${port}`);
-});
+/**
+ * Startup
+ */
+(async () => {
+  await ensureDirs();
+  await loadDb();
+  await rebuildEnabledSymlinks();
+
+  pushLog("server.start", "Server started", {
+    port: PORT,
+    LIB_DIR,
+    ENABLED_DIR,
+    DB_PATH,
+    OPENSCAD_BIN,
+    MAX_CONCURRENT_RENDERS
+  });
+
+  app.listen(PORT, () => {
+    console.log(`OpenSCAD render service running on :${PORT}`);
+  });
+})();
