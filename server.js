@@ -7,6 +7,7 @@ import crypto from "crypto";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import { pipeline } from "stream/promises";
+import { Transform, Readable } from "stream";
 
 const execFileAsync = promisify(execFile);
 const app = express();
@@ -128,9 +129,9 @@ async function saveDb(db) {
   try {
     await fs.writeFile(DB_PATH, JSON.stringify(db, null, 2), "utf8");
   } catch (e) {
-    // On free instances you *can* write /tmp, so this should succeed.
-    // If it fails, we still keep in-memory state in responses/logs.
-    pushLog("db.err", "Failed to write DB (continuing)", { error: String(e?.message || e) });
+    pushLog("db.err", "Failed to write DB (continuing)", {
+      error: String(e?.message || e),
+    });
   }
 }
 
@@ -144,16 +145,38 @@ function looksLikeGithubRepo(url) {
 }
 
 function githubCodeload(url, ref) {
-  // https://github.com/openscad/MCAD  ->  https://codeload.github.com/openscad/MCAD/tar.gz/refs/heads/master
   const m = url.trim().match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/?$/);
   if (!m) return null;
   const owner = m[1];
   const repo = m[2];
   const safeRef = (ref || "master").trim();
   return {
-    heads: `https://codeload.github.com/${owner}/${repo}/tar.gz/refs/heads/${encodeURIComponent(safeRef)}`,
-    tags: `https://codeload.github.com/${owner}/${repo}/tar.gz/refs/tags/${encodeURIComponent(safeRef)}`,
+    heads: `https://codeload.github.com/${owner}/${repo}/tar.gz/refs/heads/${encodeURIComponent(
+      safeRef
+    )}`,
+    tags: `https://codeload.github.com/${owner}/${repo}/tar.gz/refs/tags/${encodeURIComponent(
+      safeRef
+    )}`,
   };
+}
+
+// ✅ NEW: Convert GitHub "archive zip" links to codeload tarballs (so tar -xzf works)
+function githubZipToCodeloadTar(url) {
+  // https://github.com/OWNER/REPO/archive/refs/heads/REF.zip
+  // https://github.com/OWNER/REPO/archive/refs/tags/V1.2.3.zip
+  const m = url
+    .trim()
+    .match(
+      /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/archive\/refs\/(heads|tags)\/([^/]+)\.zip$/
+    );
+  if (!m) return null;
+  const owner = m[1];
+  const repo = m[2];
+  const kind = m[3];
+  const ref = m[4];
+  return `https://codeload.github.com/${owner}/${repo}/tar.gz/refs/${kind}/${encodeURIComponent(
+    ref
+  )}`;
 }
 
 async function downloadToFile(url, destPath) {
@@ -162,31 +185,33 @@ async function downloadToFile(url, destPath) {
 
   const len = Number(res.headers.get("content-length") || "0");
   if (len && len > MAX_LIB_BYTES) {
-    throw new Error(`Download too large (${len} bytes) > limit ${MAX_LIB_BYTES}`);
+    throw new Error(
+      `Download too large (${len} bytes) > limit ${MAX_LIB_BYTES}`
+    );
   }
 
   await fs.mkdir(path.dirname(destPath), { recursive: true });
   const fileStream = fsSync.createWriteStream(destPath);
 
-  // stream with size guard
   let total = 0;
-  const reader = res.body;
-  if (!reader) throw new Error("No response body");
 
-  await pipeline(
-    reader,
-    new (class extends fsSync.Transform {
-      _transform(chunk, _enc, cb) {
-        total += chunk.length;
-        if (total > MAX_LIB_BYTES) {
-          cb(new Error(`Download exceeded limit ${MAX_LIB_BYTES} bytes`));
-          return;
-        }
-        cb(null, chunk);
+  if (!res.body) throw new Error("No response body");
+
+  // Convert WHATWG stream -> Node stream (more reliable on Render)
+  const nodeReadable = Readable.fromWeb(res.body);
+
+  const limiter = new Transform({
+    transform(chunk, _enc, cb) {
+      total += chunk.length;
+      if (total > MAX_LIB_BYTES) {
+        cb(new Error(`Download exceeded limit ${MAX_LIB_BYTES} bytes`));
+        return;
       }
-    })(),
-    fileStream
-  );
+      cb(null, chunk);
+    },
+  });
+
+  await pipeline(nodeReadable, limiter, fileStream);
 
   return { bytes: total };
 }
@@ -232,34 +257,43 @@ async function installOneLibrary(lib) {
   if (!id) throw new Error("Missing library id");
 
   const ref = String(lib.ref || "master").trim();
-  let url = String(lib.url || "").trim();
+  const url = String(lib.url || "").trim();
   if (!url) throw new Error(`Library ${id}: missing url`);
 
-  // If it's a GitHub repo URL, convert to codeload tarball
+  // Determine which URL we actually download
   let usedUrl = url;
-  if (looksLikeGithubRepo(url)) {
+
+  // ✅ If it’s a GitHub archive zip URL, convert it
+  const zipTar = githubZipToCodeloadTar(url);
+  if (zipTar) {
+    usedUrl = zipTar;
+  } else if (looksLikeGithubRepo(url)) {
+    // ✅ If it's a GitHub repo URL, convert to codeload tarball
     const u = githubCodeload(url, ref);
-    // prefer heads first, then tags
-    usedUrl = u.heads;
+    usedUrl = u.heads; // prefer heads first
+  } else {
+    // If someone put a non-GitHub ZIP, we can't extract with tar.
+    if (usedUrl.endsWith(".zip")) {
+      throw new Error(
+        `Library ${id}: .zip URLs are not supported unless it's a GitHub archive URL. Use https://github.com/OWNER/REPO or a .tar.gz URL.`
+      );
+    }
   }
 
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), `lib-${id}-`));
   const tgzPath = path.join(tmpDir, "lib.tar.gz");
 
   pushLog("library.download.start", `Downloading ${id}`, { usedUrl, ref });
+
   let downloaded;
   try {
     downloaded = await downloadToFile(usedUrl, tgzPath);
   } catch (e) {
-    // if GitHub heads failed, try tags as fallback
+    // If GitHub repo heads failed, try tags as fallback
     if (looksLikeGithubRepo(url)) {
       const u = githubCodeload(url, ref);
-      try {
-        usedUrl = u.tags;
-        downloaded = await downloadToFile(usedUrl, tgzPath);
-      } catch (e2) {
-        throw e2;
-      }
+      usedUrl = u.tags;
+      downloaded = await downloadToFile(usedUrl, tgzPath);
     } else {
       throw e;
     }
@@ -267,7 +301,9 @@ async function installOneLibrary(lib) {
 
   const sha = await sha256File(tgzPath);
   if (lib.sha256 && String(lib.sha256).trim() && String(lib.sha256).trim() !== sha) {
-    throw new Error(`Library ${id}: sha256 mismatch (expected ${lib.sha256}, got ${sha})`);
+    throw new Error(
+      `Library ${id}: sha256 mismatch (expected ${lib.sha256}, got ${sha})`
+    );
   }
 
   // Extract into STORE_DIR/<id> (replace existing)
@@ -276,14 +312,15 @@ async function installOneLibrary(lib) {
   await fs.mkdir(storePath, { recursive: true });
 
   // extract tar.gz
-  await execFileAsync("tar", ["-xzf", tgzPath, "-C", storePath], { timeout: 180000 });
+  await execFileAsync("tar", ["-xzf", tgzPath, "-C", storePath], {
+    timeout: 180000,
+  });
 
   // Determine extracted "top folder"
   const entries = await listDirNames(storePath);
   const dirs = entries.filter((e) => e.isDir).map((e) => e.name);
-  let topFolder = dirs.length === 1 ? dirs[0] : null;
+  const topFolder = dirs.length === 1 ? dirs[0] : null;
 
-  // If caller provided rootFolder, try to use it, otherwise fallback gracefully.
   const desiredRootFolder = (lib.rootFolder ?? "").toString().trim();
   let finalTarget = storePath;
 
@@ -292,7 +329,6 @@ async function installOneLibrary(lib) {
     if (fsSync.existsSync(candidate) && fsSync.statSync(candidate).isDirectory()) {
       finalTarget = candidate;
     } else {
-      // Graceful fallback: if they set "BOSL2" but archive top folder is "BOSL2-master", just use top folder or store root.
       pushLog("library.rootFolder.warn", `rootFolder not found for ${id}, falling back`, {
         desiredRootFolder,
         topFolder,
@@ -300,13 +336,22 @@ async function installOneLibrary(lib) {
       if (topFolder) finalTarget = path.join(storePath, topFolder);
     }
   } else {
-    // Default to top folder if it exists (GitHub tarballs always have one)
     if (topFolder) finalTarget = path.join(storePath, topFolder);
   }
 
-  // Symlink ENABLED_DIR/<id> -> extracted folder (so OpenSCAD can include <id/...>)
+  // enable/disable
+  const enabled = lib.enabled !== false;
+
   const enabledLink = path.join(ENABLED_DIR, id);
-  await safeSymlink(finalTarget, enabledLink);
+  if (enabled) {
+    await safeSymlink(finalTarget, enabledLink);
+  } else {
+    await safeRm(enabledLink);
+  }
+
+  // store a nicer “actualRootFolder”
+  const rel = path.relative(storePath, finalTarget);
+  const actualRootFolder = rel && rel !== "" && !rel.startsWith("..") ? rel : null;
 
   const rec = {
     id,
@@ -314,9 +359,9 @@ async function installOneLibrary(lib) {
     usedUrl,
     ref,
     version: lib.version ?? null,
-    rootFolder: desiredRootFolder || topFolder || null,
+    rootFolder: desiredRootFolder || actualRootFolder || topFolder || null,
     sha256: sha,
-    enabled: lib.enabled !== false, // default true
+    enabled,
     name: lib.name ?? null,
     description: lib.description ?? null,
     keywords: lib.keywords ?? null,
@@ -330,7 +375,8 @@ async function installOneLibrary(lib) {
   pushLog("library.install.ok", `Installed ${id}`, {
     bytes: downloaded?.bytes,
     sha256: sha,
-    linkedTo: finalTarget,
+    enabled,
+    linkedTo: enabled ? finalTarget : "(disabled)",
   });
 
   await saveDb(DB);
@@ -341,7 +387,6 @@ async function applyLibraries(payload, { disableMissing = false } = {}) {
   const libs = Array.isArray(payload?.libraries) ? payload.libraries : [];
   const results = [];
   const errors = [];
-
   const desiredIds = new Set();
 
   for (const l of libs) {
@@ -351,18 +396,16 @@ async function applyLibraries(payload, { disableMissing = false } = {}) {
       desiredIds.add(id);
 
       const rec = await installOneLibrary(l);
-      // enable/disable flag
-      rec.enabled = l.enabled !== false;
-      rec.updatedAt = nowIso();
-      DB.libraries[id] = { ...DB.libraries[id], ...rec };
       results.push(rec);
     } catch (e) {
       const err = String(e?.message || e);
       errors.push({ id: l?.id || null, error: err });
+
       if (l?.id) {
-        DB.libraries[String(l.id)] = {
-          ...(DB.libraries[String(l.id)] || {}),
-          id: String(l.id),
+        const lid = String(l.id);
+        DB.libraries[lid] = {
+          ...(DB.libraries[lid] || {}),
+          id: lid,
           url: l?.url || null,
           ref: l?.ref || null,
           enabled: false,
@@ -379,6 +422,8 @@ async function applyLibraries(payload, { disableMissing = false } = {}) {
       if (!desiredIds.has(id)) {
         DB.libraries[id].enabled = false;
         DB.libraries[id].updatedAt = nowIso();
+        // remove link so OpenSCADPATH doesn't see it
+        await safeRm(path.join(ENABLED_DIR, id));
       }
     }
   }
@@ -401,7 +446,6 @@ async function autoSyncOnce() {
     if (!res.ok) throw new Error(`Manifest fetch failed ${res.status}`);
     const manifest = await res.json();
 
-    // manifest can be either { libraries: [...] } or just [...]
     const libraries = Array.isArray(manifest) ? manifest : manifest?.libraries;
     if (!Array.isArray(libraries)) throw new Error(`Manifest invalid: expected libraries[]`);
 
@@ -445,21 +489,17 @@ app.post("/render", async (req, res) => {
       OPENSCADPATH: ENABLED_DIR,
     };
 
-    // NOTE: Do NOT use --enable=manifold (your OpenSCAD build doesn't support it)
-    let stdout = "";
-    let stderr = "";
-
     try {
-      const r = await execFileAsync("openscad", ["-o", outFile, inFile], {
+      await execFileAsync("openscad", ["-o", outFile, inFile], {
         timeout: 180000,
         env,
       });
-      stdout = r.stdout || "";
-      stderr = r.stderr || "";
     } catch (e) {
-      stdout = e?.stdout || "";
-      stderr = e?.stderr || e?.message || "";
-      pushLog("render.err", "Render failed", { error: String(stderr || stdout || e?.message || e) });
+      const stdout = e?.stdout || "";
+      const stderr = e?.stderr || e?.message || "";
+      pushLog("render.err", "Render failed", {
+        error: String(stderr || stdout || e?.message || e),
+      });
       return res.status(500).json({
         error: "OpenSCAD render failed",
         details: String(stderr || stdout || e?.message || e),
@@ -488,7 +528,11 @@ app.post("/libraries/sync", requireAuth, async (req, res) => {
 
   const { installed, errors } = await applyLibraries(req.body, { disableMissing: false });
 
-  pushLog("sync.done", "Library sync finished", { ok: errors.length === 0, installed: installed.length, errors: errors.length });
+  pushLog("sync.done", "Library sync finished", {
+    ok: errors.length === 0,
+    installed: installed.length,
+    errors: errors.length,
+  });
 
   return res.json({ ok: errors.length === 0, installed, errors, db: DB });
 });
@@ -496,6 +540,7 @@ app.post("/libraries/sync", requireAuth, async (req, res) => {
 // Apply = sets enabled exactly to payload (disableMissing=true is the default)
 app.post("/libraries/apply", requireAuth, async (req, res) => {
   const disableMissing = req.body?.disableMissing !== false;
+
   pushLog("apply.start", "Library apply request", {
     librariesCount: Array.isArray(req.body?.libraries) ? req.body.libraries.length : 0,
     disableMissing,
@@ -503,7 +548,11 @@ app.post("/libraries/apply", requireAuth, async (req, res) => {
 
   const { installed, errors } = await applyLibraries(req.body, { disableMissing });
 
-  pushLog("apply.done", "Library apply finished", { ok: errors.length === 0, installed: installed.length, errors: errors.length });
+  pushLog("apply.done", "Library apply finished", {
+    ok: errors.length === 0,
+    installed: installed.length,
+    errors: errors.length,
+  });
 
   return res.json({ ok: errors.length === 0, installed, errors, db: DB });
 });
@@ -526,31 +575,23 @@ app.get("/api/status", requireAuth, async (_req, res) => {
 
 // SSE stream (EventSource can't send headers -> accept ?token=)
 app.get("/api/stream", async (req, res) => {
-  if (!authOk(req)) {
-    return res.status(401).send("Unauthorized");
-  }
+  if (!authOk(req)) return res.status(401).send("Unauthorized");
 
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders?.();
 
-  // initial
   res.write(`event: hello\ndata: ${JSON.stringify({ ok: true })}\n\n`);
-
   sseClients.add(res);
 
-  req.on("close", () => {
-    sseClients.delete(res);
-  });
+  req.on("close", () => sseClients.delete(res));
 });
 
 // ------------------------
 // Dashboard (token remembered)
 // ------------------------
 function dashboardHtml() {
-  // Single-file UI so it’s dead simple to deploy.
-  // Uses localStorage token and EventSource ?token= for live logs.
   return `<!doctype html>
 <html>
 <head>
@@ -589,7 +630,6 @@ function dashboardHtml() {
     .login { position: fixed; inset: 0; display:none; align-items:center; justify-content:center; background: rgba(0,0,0,0.55); }
     .login .panel { width: 420px; max-width: calc(100% - 28px); }
     .hr { height:1px; background: rgba(255,255,255,0.10); margin: 10px 0; }
-    a { color:#c4b5fd; text-decoration:none; }
   </style>
 </head>
 <body>
@@ -628,7 +668,7 @@ function dashboardHtml() {
   <div class="login" id="login">
     <div class="card panel">
       <div style="font-weight:800;font-size:18px;">Enter Render Token</div>
-      <div class="muted" style="margin-top:6px;">This token is stored in your browser (localStorage). You won’t be asked again.</div>
+      <div class="muted" style="margin-top:6px;">Stored in your browser (localStorage). You won’t be asked again.</div>
       <div style="margin-top:12px;">
         <input id="tokenInput" type="password" placeholder="Paste OPENSCAD_RENDER_TOKEN"/>
       </div>
@@ -636,7 +676,7 @@ function dashboardHtml() {
         <button class="btn primary" id="saveToken">Save</button>
         <button class="btn" id="cancelToken">Cancel</button>
       </div>
-      <div class="muted" style="margin-top:10px;">Tip: you can also open <span class="mono">/?token=YOUR_TOKEN</span> once.</div>
+      <div class="muted" style="margin-top:10px;">Tip: open <span class="mono">/?token=YOUR_TOKEN</span> once.</div>
     </div>
   </div>
 
@@ -656,7 +696,6 @@ function dashboardHtml() {
   const cancelTokenBtn = document.getElementById('cancelToken');
 
   function getToken() { return localStorage.getItem('render_token') || ''; }
-
   function showLogin() { loginEl.style.display = 'flex'; tokenInput.value = ''; tokenInput.focus(); }
   function hideLogin() { loginEl.style.display = 'none'; }
 
@@ -741,27 +780,23 @@ function dashboardHtml() {
     const t = getToken();
     if (!t) return;
 
-    try {
-      const es = new EventSource('/api/stream?token=' + encodeURIComponent(t));
-      liveEl.textContent = 'Live: connecting…';
+    const es = new EventSource('/api/stream?token=' + encodeURIComponent(t));
+    liveEl.textContent = 'Live: connecting…';
 
-      es.addEventListener('hello', () => {
-        liveEl.textContent = 'Live: connected';
-      });
+    es.addEventListener('hello', () => {
+      liveEl.textContent = 'Live: connected';
+    });
 
-      es.addEventListener('log', (ev) => {
-        try {
-          const data = JSON.parse(ev.data);
-          appendLog(data.line);
-        } catch {}
-      });
+    es.addEventListener('log', (ev) => {
+      try {
+        const data = JSON.parse(ev.data);
+        appendLog(data.line);
+      } catch {}
+    });
 
-      es.onerror = () => {
-        liveEl.textContent = 'Live: disconnected';
-      };
-    } catch {
+    es.onerror = () => {
       liveEl.textContent = 'Live: disconnected';
-    }
+    };
   }
 
   async function boot() {
@@ -780,7 +815,7 @@ function dashboardHtml() {
       if (String(e.message).includes('unauthorized')) {
         showLogin();
       } else {
-        appendLog(nowIso() + ' [ui.err] ' + (e.message || String(e)));
+        appendLog(new Date().toISOString() + ' [ui.err] ' + (e.message || String(e)));
       }
     }
   }
@@ -791,7 +826,6 @@ function dashboardHtml() {
 </html>`;
 }
 
-// Always serve UI (even if unauth); UI will ask for token once.
 app.get("/", async (req, res) => {
   // If they provided ?token= and it matches, set a cookie too (nice-to-have)
   if (TOKEN && typeof req.query.token === "string" && req.query.token === TOKEN) {
