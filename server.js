@@ -20,6 +20,12 @@ app.use(express.json({ limit: "10mb" }));
 
 const TOKEN = process.env.OPENSCAD_RENDER_TOKEN || "";
 
+// Optional: make status endpoints + dashboard public (useful for iframe/3rd-party storage blocking)
+// Keep render + sync still protected by TOKEN.
+const STATUS_PUBLIC =
+  String(process.env.OPENSCAD_STATUS_PUBLIC || "").toLowerCase() === "true" ||
+  String(process.env.OPENSCAD_STATUS_PUBLIC || "") === "1";
+
 // IMPORTANT for free Render: use /tmp (writable) and expect it to wipe on restarts
 const LIB_ROOT = process.env.OPENSCAD_LIB_DIR || "/tmp/openscad-libs";
 const STORE_DIR = path.join(LIB_ROOT, "_store");
@@ -52,7 +58,6 @@ function pushLog(tag, msg, data) {
   logs.push(line);
   while (logs.length > MAX_LOG_LINES) logs.shift();
 
-  // Broadcast to SSE
   for (const res of sseClients) {
     try {
       res.write(`event: log\ndata: ${JSON.stringify({ line })}\n\n`);
@@ -77,15 +82,12 @@ function parseCookies(cookieHeader) {
 }
 
 function reqToken(req) {
-  // 1) Authorization header
   const h = req.headers.authorization || "";
   if (h.startsWith("Bearer ")) return h.slice("Bearer ".length).trim();
 
-  // 2) Query token (needed for EventSource)
   if (typeof req.query.token === "string" && req.query.token.trim())
     return req.query.token.trim();
 
-  // 3) Cookie
   const cookies = parseCookies(req.headers.cookie || "");
   if (cookies.auth_token) return cookies.auth_token;
 
@@ -93,18 +95,26 @@ function reqToken(req) {
 }
 
 function authOk(req) {
-  if (!TOKEN) return true; // if you haven't set a token, everything is open
+  if (!TOKEN) return true; // no token set => open
   const t = reqToken(req);
   return !!t && t === TOKEN;
 }
 
 function requireAuth(req, res, next) {
   if (!authOk(req)) {
-    return res.status(401).send(
-      `Unauthorized\n\nOpen "/?token=YOUR_TOKEN" once to login (saved in browser), or send Authorization: Bearer YOUR_TOKEN`
-    );
+    return res
+      .status(401)
+      .send(
+        `Unauthorized\n\nOpen "/?token=YOUR_TOKEN" once to login (saved in browser), or send Authorization: Bearer YOUR_TOKEN`
+      );
   }
   next();
+}
+
+// For dashboard/status endpoints only:
+function requireStatusAuth(req, res, next) {
+  if (STATUS_PUBLIC) return next();
+  return requireAuth(req, res, next);
 }
 
 async function ensureDirs() {
@@ -160,10 +170,8 @@ function githubCodeload(url, ref) {
   };
 }
 
-// ✅ NEW: Convert GitHub "archive zip" links to codeload tarballs (so tar -xzf works)
+// Convert GitHub archive zip URL -> codeload tar.gz (so tar -xzf works)
 function githubZipToCodeloadTar(url) {
-  // https://github.com/OWNER/REPO/archive/refs/heads/REF.zip
-  // https://github.com/OWNER/REPO/archive/refs/tags/V1.2.3.zip
   const m = url
     .trim()
     .match(
@@ -194,11 +202,12 @@ async function downloadToFile(url, destPath) {
   const fileStream = fsSync.createWriteStream(destPath);
 
   let total = 0;
-
   if (!res.body) throw new Error("No response body");
 
-  // Convert WHATWG stream -> Node stream (more reliable on Render)
-  const nodeReadable = Readable.fromWeb(res.body);
+  const nodeReadable =
+    typeof Readable.fromWeb === "function" && typeof res.body.getReader === "function"
+      ? Readable.fromWeb(res.body)
+      : res.body;
 
   const limiter = new Transform({
     transform(chunk, _enc, cb) {
@@ -212,7 +221,6 @@ async function downloadToFile(url, destPath) {
   });
 
   await pipeline(nodeReadable, limiter, fileStream);
-
   return { bytes: total };
 }
 
@@ -249,6 +257,126 @@ async function safeSymlink(target, linkPath) {
   await fs.symlink(target, linkPath, "dir");
 }
 
+function existsSyncSafe(p) {
+  try {
+    return fsSync.existsSync(p);
+  } catch {
+    return false;
+  }
+}
+
+// ------------------------
+// LIVE status helpers (disk truth)
+// ------------------------
+function getDiskStatus(id) {
+  const storePath = path.join(STORE_DIR, id);
+  const enabledLink = path.join(ENABLED_DIR, id);
+
+  const storeExists = existsSyncSafe(storePath);
+
+  let enabledLinkExists = false;
+  let enabledTarget = null;
+  let enabledTargetExists = false;
+
+  try {
+    if (existsSyncSafe(enabledLink)) {
+      enabledLinkExists = true;
+      // resolve symlink target (works even if target gone)
+      try {
+        const linkTarget = fsSync.readlinkSync(enabledLink);
+        enabledTarget = path.isAbsolute(linkTarget)
+          ? linkTarget
+          : path.resolve(path.dirname(enabledLink), linkTarget);
+      } catch {
+        enabledTarget = null;
+      }
+      enabledTargetExists = enabledTarget ? existsSyncSafe(enabledTarget) : false;
+    }
+  } catch {
+    enabledLinkExists = false;
+  }
+
+  const render_enabled = enabledLinkExists && enabledTargetExists;
+  const render_installed = storeExists || enabledTargetExists;
+
+  return {
+    storePath,
+    enabledLink,
+    storeExists,
+    enabledLinkExists,
+    enabledTarget,
+    enabledTargetExists,
+    render_enabled,
+    render_installed,
+  };
+}
+
+function buildLiveLibraryRecord(id) {
+  const dbRec = DB.libraries?.[id] || { id };
+  const disk = getDiskStatus(id);
+
+  return {
+    // DB fields (desired/configured)
+    id: dbRec.id ?? id,
+    url: dbRec.url ?? null,
+    usedUrl: dbRec.usedUrl ?? null,
+    ref: dbRec.ref ?? null,
+    version: dbRec.version ?? null,
+    rootFolder: dbRec.rootFolder ?? null,
+    sha256: dbRec.sha256 ?? null,
+    name: dbRec.name ?? null,
+    description: dbRec.description ?? null,
+    keywords: dbRec.keywords ?? null,
+
+    // What DB thinks is enabled (desired)
+    enabled: dbRec.enabled !== false,
+
+    // Errors/timestamps
+    installedAt: dbRec.installedAt ?? null,
+    updatedAt: dbRec.updatedAt ?? null,
+    lastError: dbRec.lastError ?? null,
+
+    // LIVE truth (what matters for your "Refresh Status" button)
+    render_enabled: disk.render_enabled,
+    render_installed: disk.render_installed,
+    disk: {
+      storeExists: disk.storeExists,
+      enabledLinkExists: disk.enabledLinkExists,
+      enabledTargetExists: disk.enabledTargetExists,
+      enabledTarget: disk.enabledTarget,
+    },
+  };
+}
+
+async function listLiveLibraries() {
+  const ids = new Set([
+    ...Object.keys(DB.libraries || {}),
+    ...(await (async () => {
+      try {
+        const entries = await fs.readdir(ENABLED_DIR);
+        return entries || [];
+      } catch {
+        return [];
+      }
+    })()),
+    ...(await (async () => {
+      try {
+        const entries = await fs.readdir(STORE_DIR);
+        return entries || [];
+      } catch {
+        return [];
+      }
+    })()),
+  ]);
+
+  const out = {};
+  for (const id of ids) {
+    if (!id) continue;
+    out[id] = buildLiveLibraryRecord(id);
+  }
+  return out;
+}
+
 // ------------------------
 // Library install logic
 // ------------------------
@@ -260,19 +388,15 @@ async function installOneLibrary(lib) {
   const url = String(lib.url || "").trim();
   if (!url) throw new Error(`Library ${id}: missing url`);
 
-  // Determine which URL we actually download
   let usedUrl = url;
 
-  // ✅ If it’s a GitHub archive zip URL, convert it
   const zipTar = githubZipToCodeloadTar(url);
   if (zipTar) {
     usedUrl = zipTar;
   } else if (looksLikeGithubRepo(url)) {
-    // ✅ If it's a GitHub repo URL, convert to codeload tarball
     const u = githubCodeload(url, ref);
-    usedUrl = u.heads; // prefer heads first
+    usedUrl = u.heads;
   } else {
-    // If someone put a non-GitHub ZIP, we can't extract with tar.
     if (usedUrl.endsWith(".zip")) {
       throw new Error(
         `Library ${id}: .zip URLs are not supported unless it's a GitHub archive URL. Use https://github.com/OWNER/REPO or a .tar.gz URL.`
@@ -289,7 +413,6 @@ async function installOneLibrary(lib) {
   try {
     downloaded = await downloadToFile(usedUrl, tgzPath);
   } catch (e) {
-    // If GitHub repo heads failed, try tags as fallback
     if (looksLikeGithubRepo(url)) {
       const u = githubCodeload(url, ref);
       usedUrl = u.tags;
@@ -306,17 +429,14 @@ async function installOneLibrary(lib) {
     );
   }
 
-  // Extract into STORE_DIR/<id> (replace existing)
   const storePath = path.join(STORE_DIR, id);
   await safeRm(storePath);
   await fs.mkdir(storePath, { recursive: true });
 
-  // extract tar.gz
   await execFileAsync("tar", ["-xzf", tgzPath, "-C", storePath], {
     timeout: 180000,
   });
 
-  // Determine extracted "top folder"
   const entries = await listDirNames(storePath);
   const dirs = entries.filter((e) => e.isDir).map((e) => e.name);
   const topFolder = dirs.length === 1 ? dirs[0] : null;
@@ -326,7 +446,7 @@ async function installOneLibrary(lib) {
 
   if (desiredRootFolder) {
     const candidate = path.join(storePath, desiredRootFolder);
-    if (fsSync.existsSync(candidate) && fsSync.statSync(candidate).isDirectory()) {
+    if (existsSyncSafe(candidate) && fsSync.statSync(candidate).isDirectory()) {
       finalTarget = candidate;
     } else {
       pushLog("library.rootFolder.warn", `rootFolder not found for ${id}, falling back`, {
@@ -339,9 +459,7 @@ async function installOneLibrary(lib) {
     if (topFolder) finalTarget = path.join(storePath, topFolder);
   }
 
-  // enable/disable
   const enabled = lib.enabled !== false;
-
   const enabledLink = path.join(ENABLED_DIR, id);
   if (enabled) {
     await safeSymlink(finalTarget, enabledLink);
@@ -349,9 +467,9 @@ async function installOneLibrary(lib) {
     await safeRm(enabledLink);
   }
 
-  // store a nicer “actualRootFolder”
   const rel = path.relative(storePath, finalTarget);
-  const actualRootFolder = rel && rel !== "" && !rel.startsWith("..") ? rel : null;
+  const actualRootFolder =
+    rel && rel !== "" && !rel.startsWith("..") ? rel : null;
 
   const rec = {
     id,
@@ -380,6 +498,12 @@ async function installOneLibrary(lib) {
   });
 
   await saveDb(DB);
+
+  // cleanup temp dir
+  try {
+    await safeRm(tmpDir);
+  } catch {}
+
   return rec;
 }
 
@@ -407,13 +531,18 @@ async function applyLibraries(payload, { disableMissing = false } = {}) {
           ...(DB.libraries[lid] || {}),
           id: lid,
           url: l?.url || null,
+          usedUrl: DB.libraries[lid]?.usedUrl || null,
           ref: l?.ref || null,
           enabled: false,
           updatedAt: nowIso(),
           lastError: err,
         };
       }
-      pushLog("library.install.err", `Install failed`, { id: l?.id || null, error: err });
+
+      pushLog("library.install.err", "Install failed", {
+        id: l?.id || null,
+        error: err,
+      });
     }
   }
 
@@ -422,7 +551,6 @@ async function applyLibraries(payload, { disableMissing = false } = {}) {
       if (!desiredIds.has(id)) {
         DB.libraries[id].enabled = false;
         DB.libraries[id].updatedAt = nowIso();
-        // remove link so OpenSCADPATH doesn't see it
         await safeRm(path.join(ENABLED_DIR, id));
       }
     }
@@ -447,7 +575,7 @@ async function autoSyncOnce() {
     const manifest = await res.json();
 
     const libraries = Array.isArray(manifest) ? manifest : manifest?.libraries;
-    if (!Array.isArray(libraries)) throw new Error(`Manifest invalid: expected libraries[]`);
+    if (!Array.isArray(libraries)) throw new Error("Manifest invalid: expected libraries[]");
 
     pushLog("autosync.apply", "Applying manifest", { count: libraries.length });
     await applyLibraries({ libraries }, { disableMissing: true });
@@ -464,6 +592,7 @@ app.get("/health", (_req, res) => res.status(200).send("ok"));
 
 app.post("/render", async (req, res) => {
   try {
+    // Always protect render unless TOKEN is empty
     if (!authOk(req)) return res.status(401).json({ error: "Unauthorized" });
 
     const { code, format } = req.body || {};
@@ -474,7 +603,9 @@ app.post("/render", async (req, res) => {
       return res.status(400).json({ error: "Only format=stl is supported" });
     }
 
-    pushLog("render.start", "Render requested", { bytes: Buffer.byteLength(code, "utf8") });
+    pushLog("render.start", "Render requested", {
+      bytes: Buffer.byteLength(code, "utf8"),
+    });
 
     const jobId = crypto.randomBytes(6).toString("hex");
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), `scad-${jobId}-`));
@@ -483,7 +614,6 @@ app.post("/render", async (req, res) => {
 
     await fs.writeFile(inFile, code, "utf8");
 
-    // Set OPENSCADPATH to enabled libs so `use <LIB/...>` resolves.
     const env = {
       ...process.env,
       OPENSCADPATH: ENABLED_DIR,
@@ -537,10 +667,8 @@ app.post("/libraries/sync", requireAuth, async (req, res) => {
   return res.json({ ok: errors.length === 0, installed, errors, db: DB });
 });
 
-// Apply = sets enabled exactly to payload (disableMissing=true is the default)
 app.post("/libraries/apply", requireAuth, async (req, res) => {
   const disableMissing = req.body?.disableMissing !== false;
-
   pushLog("apply.start", "Library apply request", {
     librariesCount: Array.isArray(req.body?.libraries) ? req.body.libraries.length : 0,
     disableMissing,
@@ -557,11 +685,66 @@ app.post("/libraries/apply", requireAuth, async (req, res) => {
   return res.json({ ok: errors.length === 0, installed, errors, db: DB });
 });
 
-app.get("/api/status", requireAuth, async (_req, res) => {
+// ------------------------
+// STATUS ENDPOINTS (what your Admin "Refresh Status" should read)
+// ------------------------
+
+// Live map of ALL libs known by DB or present on disk
+app.get("/api/libraries", requireStatusAuth, async (_req, res) => {
   res.setHeader("Cache-Control", "no-store");
+  const libraries = await listLiveLibraries();
   return res.json({
     ok: true,
-    db: DB,
+    ts: nowIso(),
+    libraries,
+  });
+});
+
+// Compare helper: send expected IDs, get missing/extra + statuses
+app.post("/api/libraries/status", requireStatusAuth, async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+
+  const expectedIdsRaw =
+    req.body?.expectedIds ||
+    req.body?.ids ||
+    (Array.isArray(req.body?.libraries) ? req.body.libraries.map((x) => x?.id) : []);
+
+  const expectedIds = (Array.isArray(expectedIdsRaw) ? expectedIdsRaw : [])
+    .map((x) => String(x || "").trim())
+    .filter(Boolean);
+
+  const live = await listLiveLibraries();
+  const liveIds = Object.keys(live);
+
+  const expectedSet = new Set(expectedIds);
+  const liveSet = new Set(liveIds);
+
+  const missingIds = expectedIds.filter((id) => !liveSet.has(id));
+  const extraIds = liveIds.filter((id) => !expectedSet.has(id));
+
+  // statuses only for expected ids (common use)
+  const statuses = {};
+  for (const id of expectedIds) statuses[id] = live[id] || { id, render_installed: false, render_enabled: false };
+
+  return res.json({
+    ok: true,
+    ts: nowIso(),
+    expectedCount: expectedIds.length,
+    liveCount: liveIds.length,
+    missingIds,
+    extraIds,
+    statuses,
+  });
+});
+
+// Keep original status endpoint, but include live libraries too
+app.get("/api/status", requireStatusAuth, async (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  const libraries = await listLiveLibraries();
+  return res.json({
+    ok: true,
+    db: DB,        // raw/intended
+    libraries,     // LIVE truth (use this for your Refresh Status)
     logs,
     env: {
       port: Number(process.env.PORT || 3000),
@@ -569,13 +752,14 @@ app.get("/api/status", requireAuth, async (_req, res) => {
       ENABLED_DIR,
       DB_PATH,
       AUTOSYNC_URL: AUTOSYNC_URL ? "(set)" : "",
+      STATUS_PUBLIC,
     },
   });
 });
 
 // SSE stream (EventSource can't send headers -> accept ?token=)
-app.get("/api/stream", async (req, res) => {
-  if (!authOk(req)) return res.status(401).send("Unauthorized");
+app.get("/api/stream", requireStatusAuth, async (req, res) => {
+  if (!STATUS_PUBLIC && !authOk(req)) return res.status(401).send("Unauthorized");
 
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -614,7 +798,6 @@ function dashboardHtml() {
     .pill { display:inline-flex; align-items:center; gap:8px; padding: 6px 10px; border-radius: 999px; font-size: 12px; background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.10); }
     .btn { cursor:pointer; padding: 8px 12px; border-radius: 10px; border:1px solid rgba(255,255,255,0.14); background: rgba(255,255,255,0.08); color:#fff; }
     .btn.primary { background: linear-gradient(135deg,#7c3aed,#a855f7); border: none; }
-    .btn:disabled { opacity:.5; cursor:not-allowed; }
     .toolbar { display:flex; align-items:center; gap:10px; }
     input[type="text"], input[type="password"] { width:100%; padding: 10px 12px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.14); background: rgba(0,0,0,0.25); color:#fff; outline:none; }
     .grid { display:grid; grid-template-columns: 1fr; gap: 12px; margin-top: 12px; }
@@ -637,7 +820,7 @@ function dashboardHtml() {
     <div class="top">
       <div>
         <h1>OpenSCAD Render Service — Library Monitor</h1>
-        <div class="sub">Live view of installed/enabled libraries + sync/render logs. (Free Render: libs re-download after restarts)</div>
+        <div class="sub">Live view of installed/enabled libraries + sync/render logs.</div>
       </div>
       <div class="toolbar">
         <span class="pill" id="live">Live: connecting…</span>
@@ -668,7 +851,7 @@ function dashboardHtml() {
   <div class="login" id="login">
     <div class="card panel">
       <div style="font-weight:800;font-size:18px;">Enter Render Token</div>
-      <div class="muted" style="margin-top:6px;">Stored in your browser (localStorage). You won’t be asked again.</div>
+      <div class="muted" style="margin-top:6px;">Stored in your browser (localStorage). You won’t be asked again (unless iframe storage is blocked).</div>
       <div style="margin-top:12px;">
         <input id="tokenInput" type="password" placeholder="Paste OPENSCAD_RENDER_TOKEN"/>
       </div>
@@ -676,7 +859,7 @@ function dashboardHtml() {
         <button class="btn primary" id="saveToken">Save</button>
         <button class="btn" id="cancelToken">Cancel</button>
       </div>
-      <div class="muted" style="margin-top:10px;">Tip: open <span class="mono">/?token=YOUR_TOKEN</span> once.</div>
+      <div class="muted" style="margin-top:10px;">Tip: open <span class="mono">/?token=YOUR_TOKEN</span> once to set cookie.</div>
     </div>
   </div>
 
@@ -712,7 +895,6 @@ function dashboardHtml() {
     localStorage.removeItem('render_token');
     location.reload();
   };
-
   document.getElementById('refresh').onclick = () => boot();
 
   const logbox = document.getElementById('logbox');
@@ -734,9 +916,9 @@ function dashboardHtml() {
 
   function renderLibraries() {
     const q = (searchEl.value || '').toLowerCase();
-    const libs = (statusCache?.db?.libraries) || {};
+    const libs = (statusCache?.libraries) || (statusCache?.db?.libraries) || {};
     const list = Object.values(libs)
-      .filter(x => !q || (x.id || '').toLowerCase().includes(q) || (x.url||'').toLowerCase().includes(q));
+      .filter(x => !q || (x.id || '').toLowerCase().includes(q) || (x.url||'').toLowerCase().includes(q) || (x.usedUrl||'').toLowerCase().includes(q));
 
     countEl.textContent = list.length + ' of ' + Object.keys(libs).length + ' libraries';
     libsEl.innerHTML = '';
@@ -752,10 +934,11 @@ function dashboardHtml() {
     for (const lib of list.sort((a,b) => (a.id||'').localeCompare(b.id||''))) {
       const box = document.createElement('div');
       box.className = 'lib';
+      const enabled = !!lib.render_enabled; // LIVE
       box.innerHTML = \`
         <div class="libTop">
           <div class="libId">\${lib.id || '(no id)'}</div>
-          <span class="tag \${lib.enabled ? 'on' : 'off'}">\${lib.enabled ? 'Enabled' : 'Disabled'}</span>
+          <span class="tag \${enabled ? 'on' : 'off'}">\${enabled ? 'Installed+Enabled' : (lib.render_installed ? 'Installed (disabled)' : 'Not installed')}</span>
         </div>
         <div class="muted" style="margin-top:6px;word-break:break-all;">\${lib.usedUrl || lib.url || ''}</div>
         <div class="muted" style="margin-top:6px;">Last Sync: \${lib.updatedAt ? new Date(lib.updatedAt).toLocaleString() : '—'}</div>
@@ -778,30 +961,33 @@ function dashboardHtml() {
 
   function connectSSE() {
     const t = getToken();
-    if (!t) return;
+    try {
+      const url = t ? ('/api/stream?token=' + encodeURIComponent(t)) : '/api/stream';
+      const es = new EventSource(url);
+      liveEl.textContent = 'Live: connecting…';
 
-    const es = new EventSource('/api/stream?token=' + encodeURIComponent(t));
-    liveEl.textContent = 'Live: connecting…';
+      es.addEventListener('hello', () => {
+        liveEl.textContent = 'Live: connected';
+      });
 
-    es.addEventListener('hello', () => {
-      liveEl.textContent = 'Live: connected';
-    });
+      es.addEventListener('log', (ev) => {
+        try {
+          const data = JSON.parse(ev.data);
+          appendLog(data.line);
+        } catch {}
+      });
 
-    es.addEventListener('log', (ev) => {
-      try {
-        const data = JSON.parse(ev.data);
-        appendLog(data.line);
-      } catch {}
-    });
-
-    es.onerror = () => {
+      es.onerror = () => {
+        liveEl.textContent = 'Live: disconnected';
+      };
+    } catch {
       liveEl.textContent = 'Live: disconnected';
-    };
+    }
   }
 
   async function boot() {
     const t = getToken();
-    if (!t && ${TOKEN ? "true" : "false"}) { showLogin(); return; }
+    if (!t && ${TOKEN ? "true" : "false"} && ${STATUS_PUBLIC ? "false" : "true"}) { showLogin(); return; }
     hideLogin();
 
     try {
@@ -810,7 +996,6 @@ function dashboardHtml() {
       (statusCache.logs || []).forEach(appendLog);
       renderLibraries();
       connectSSE();
-      liveEl.textContent = 'Live: connected';
     } catch (e) {
       if (String(e.message).includes('unauthorized')) {
         showLogin();
@@ -826,8 +1011,8 @@ function dashboardHtml() {
 </html>`;
 }
 
+// Serve UI
 app.get("/", async (req, res) => {
-  // If they provided ?token= and it matches, set a cookie too (nice-to-have)
   if (TOKEN && typeof req.query.token === "string" && req.query.token === TOKEN) {
     res.setHeader(
       "Set-Cookie",
@@ -851,12 +1036,11 @@ async function main() {
     LIB_ROOT,
     ENABLED_DIR,
     DB_PATH,
+    STATUS_PUBLIC,
   });
 
-  // Auto-sync on boot (critical for free instances)
   await autoSyncOnce();
 
-  // Periodic auto-sync while awake
   if (AUTOSYNC_URL) {
     setInterval(() => autoSyncOnce().catch(() => {}), AUTOSYNC_INTERVAL_MS).unref?.();
   }
