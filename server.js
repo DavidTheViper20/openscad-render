@@ -1,3 +1,8 @@
+// server.js (ESM)
+// OpenSCAD Render Service + Library Sync + Live Dashboard
+// Adds: per-library delete button (with confirm), mobile-friendly token modal,
+// color-coded “explanation” under each log, and log view filters (raw / both / explain)
+
 import express from "express";
 import fs from "fs/promises";
 import fsSync from "fs";
@@ -7,7 +12,7 @@ import crypto from "crypto";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import { pipeline } from "stream/promises";
-import { Transform, Readable } from "stream";
+import { Transform } from "stream";
 
 const execFileAsync = promisify(execFile);
 const app = express();
@@ -20,12 +25,6 @@ app.use(express.json({ limit: "10mb" }));
 
 const TOKEN = process.env.OPENSCAD_RENDER_TOKEN || "";
 
-// Optional: make status endpoints + dashboard public (useful for iframe/3rd-party storage blocking)
-// Keep render + sync still protected by TOKEN.
-const STATUS_PUBLIC =
-  String(process.env.OPENSCAD_STATUS_PUBLIC || "").toLowerCase() === "true" ||
-  String(process.env.OPENSCAD_STATUS_PUBLIC || "") === "1";
-
 // IMPORTANT for free Render: use /tmp (writable) and expect it to wipe on restarts
 const LIB_ROOT = process.env.OPENSCAD_LIB_DIR || "/tmp/openscad-libs";
 const STORE_DIR = path.join(LIB_ROOT, "_store");
@@ -34,37 +33,19 @@ const DB_PATH = path.join(LIB_ROOT, "libdb.json");
 
 // Optional: auto-sync source (recommended so you never manually sync again)
 const AUTOSYNC_URL = process.env.OPENSCAD_AUTOSYNC_URL || "";
-const AUTOSYNC_TOKEN = process.env.OPENSCAD_AUTOSYNC_TOKEN || ""; // if your manifest endpoint needs auth
-const AUTOSYNC_INTERVAL_MS = Number(process.env.OPENSCAD_AUTOSYNC_INTERVAL_MS || "300000"); // 5 min default
+const AUTOSYNC_TOKEN = process.env.OPENSCAD_AUTOSYNC_TOKEN || "";
+const AUTOSYNC_INTERVAL_MS = Number(process.env.OPENSCAD_AUTOSYNC_INTERVAL_MS || "300000");
 
 // Limits
-const MAX_LOG_LINES = 600;
-const MAX_LIB_DOWNLOAD_MB = Number(process.env.OPENSCAD_MAX_LIB_MB || "200"); // safety
+const MAX_LOG_LINES = 800;
+const MAX_LIB_DOWNLOAD_MB = Number(process.env.OPENSCAD_MAX_LIB_MB || "200");
 const MAX_LIB_BYTES = MAX_LIB_DOWNLOAD_MB * 1024 * 1024;
 
 // ------------------------
-// Small helpers
+// Helpers: time, auth, SSE, logs
 // ------------------------
 function nowIso() {
   return new Date().toISOString();
-}
-
-const logs = [];
-const sseClients = new Set();
-
-function pushLog(tag, msg, data) {
-  const line =
-    `${nowIso()} [${tag}] ${msg}` + (data ? ` ${JSON.stringify(data)}` : "");
-  logs.push(line);
-  while (logs.length > MAX_LOG_LINES) logs.shift();
-
-  for (const res of sseClients) {
-    try {
-      res.write(`event: log\ndata: ${JSON.stringify({ line })}\n\n`);
-    } catch {
-      // ignore
-    }
-  }
 }
 
 function parseCookies(cookieHeader) {
@@ -82,12 +63,14 @@ function parseCookies(cookieHeader) {
 }
 
 function reqToken(req) {
+  // 1) Authorization header
   const h = req.headers.authorization || "";
   if (h.startsWith("Bearer ")) return h.slice("Bearer ".length).trim();
 
-  if (typeof req.query.token === "string" && req.query.token.trim())
-    return req.query.token.trim();
+  // 2) Query token (needed for EventSource)
+  if (typeof req.query.token === "string" && req.query.token.trim()) return req.query.token.trim();
 
+  // 3) Cookie
   const cookies = parseCookies(req.headers.cookie || "");
   if (cookies.auth_token) return cookies.auth_token;
 
@@ -95,7 +78,7 @@ function reqToken(req) {
 }
 
 function authOk(req) {
-  if (!TOKEN) return true; // no token set => open
+  if (!TOKEN) return true;
   const t = reqToken(req);
   return !!t && t === TOKEN;
 }
@@ -111,12 +94,87 @@ function requireAuth(req, res, next) {
   next();
 }
 
-// For dashboard/status endpoints only:
-function requireStatusAuth(req, res, next) {
-  if (STATUS_PUBLIC) return next();
-  return requireAuth(req, res, next);
+// SSE
+const sseClients = new Set();
+
+function sseBroadcast(event, payload) {
+  const data = JSON.stringify(payload);
+  for (const res of sseClients) {
+    try {
+      res.write(`event: ${event}\ndata: ${data}\n\n`);
+    } catch {
+      // ignore
+    }
+  }
 }
 
+// Logs (structured)
+const logEntries = [];
+
+function explainLog(tag, msg, data) {
+  // Level by tag pattern
+  let level = "info";
+  if (tag.includes(".err") || tag === "render.err") level = "error";
+  else if (tag.includes(".warn")) level = "warn";
+
+  // Tiny explanation mapping
+  const map = {
+    "server.start": "Server booted. Ready to render & sync libraries.",
+    "render.start": "Starting an OpenSCAD render job.",
+    "render.ok": "Render finished. Returning STL bytes.",
+    "render.err": "Render failed. OpenSCAD returned an error.",
+    "sync.start": "Sync request received from your website/admin.",
+    "sync.done": "Sync request completed.",
+    "apply.start": "Applying full library set (optionally disabling missing).",
+    "apply.done": "Apply completed.",
+    "autosync.start": "Auto-sync: fetching your manifest.",
+    "autosync.apply": "Auto-sync: installing/updating libraries from manifest.",
+    "autosync.ok": "Auto-sync finished successfully.",
+    "autosync.err": "Auto-sync failed (manifest fetch or install error).",
+    "db.err": "Couldn’t persist DB file; continuing with in-memory state.",
+    "library.download.start": "Downloading library archive.",
+    "library.install.ok": "Library extracted and linked. Usable via use <LIB/...>.",
+    "library.install.err": "Library install failed; it will be marked disabled.",
+    "library.rootFolder.warn": "Requested rootFolder missing; using fallback folder.",
+    "library.delete.start": "Deleting library from server (store + enabled link + DB).",
+    "library.delete.ok": "Library deleted.",
+    "library.delete.err": "Delete failed (see details).",
+  };
+
+  let explain = map[tag] || "Update received.";
+  // Add small dynamic hint for some events
+  if (tag === "library.install.ok" && data?.id) explain = `Installed “${data.id}”. Now available to renders.`;
+  if (tag === "library.install.err" && data?.id) explain = `Failed installing “${data.id}”. It will not be available to renders.`;
+  if (tag === "library.delete.ok" && data?.id) explain = `Deleted “${data.id}” from the server.`;
+
+  return { level, explain };
+}
+
+function pushLog(tag, msg, data) {
+  const { level, explain } = explainLog(tag, msg, data);
+  const entry = {
+    ts: nowIso(),
+    tag,
+    msg,
+    data: data ?? null,
+    level,   // info | warn | error
+    explain, // tiny human explanation
+  };
+  entry.line = `${entry.ts} [${tag}] ${msg}` + (data ? ` ${JSON.stringify(data)}` : "");
+
+  logEntries.push(entry);
+  while (logEntries.length > MAX_LOG_LINES) logEntries.shift();
+
+  sseBroadcast("log", entry);
+}
+
+function broadcastLibraries(DB) {
+  sseBroadcast("libraries", { libraries: DB.libraries, at: nowIso() });
+}
+
+// ------------------------
+// FS/DB helpers
+// ------------------------
 async function ensureDirs() {
   await fs.mkdir(LIB_ROOT, { recursive: true });
   await fs.mkdir(STORE_DIR, { recursive: true });
@@ -139,9 +197,29 @@ async function saveDb(db) {
   try {
     await fs.writeFile(DB_PATH, JSON.stringify(db, null, 2), "utf8");
   } catch (e) {
-    pushLog("db.err", "Failed to write DB (continuing)", {
-      error: String(e?.message || e),
-    });
+    pushLog("db.err", "Failed to write DB (continuing)", { error: String(e?.message || e) });
+  }
+}
+
+async function safeRm(p) {
+  try {
+    await fs.rm(p, { recursive: true, force: true });
+  } catch {
+    // ignore
+  }
+}
+
+async function safeSymlink(target, linkPath) {
+  await safeRm(linkPath);
+  await fs.symlink(target, linkPath, "dir");
+}
+
+async function listDirNames(p) {
+  try {
+    const entries = await fs.readdir(p, { withFileTypes: true });
+    return entries.map((e) => ({ name: e.name, isDir: e.isDirectory() }));
+  } catch {
+    return [];
   }
 }
 
@@ -161,66 +239,45 @@ function githubCodeload(url, ref) {
   const repo = m[2];
   const safeRef = (ref || "master").trim();
   return {
-    heads: `https://codeload.github.com/${owner}/${repo}/tar.gz/refs/heads/${encodeURIComponent(
-      safeRef
-    )}`,
-    tags: `https://codeload.github.com/${owner}/${repo}/tar.gz/refs/tags/${encodeURIComponent(
-      safeRef
-    )}`,
+    heads: `https://codeload.github.com/${owner}/${repo}/tar.gz/refs/heads/${encodeURIComponent(safeRef)}`,
+    tags: `https://codeload.github.com/${owner}/${repo}/tar.gz/refs/tags/${encodeURIComponent(safeRef)}`,
   };
 }
 
-// Convert GitHub archive zip URL -> codeload tar.gz (so tar -xzf works)
-function githubZipToCodeloadTar(url) {
-  const m = url
-    .trim()
-    .match(
-      /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/archive\/refs\/(heads|tags)\/([^/]+)\.zip$/
-    );
-  if (!m) return null;
-  const owner = m[1];
-  const repo = m[2];
-  const kind = m[3];
-  const ref = m[4];
-  return `https://codeload.github.com/${owner}/${repo}/tar.gz/refs/${kind}/${encodeURIComponent(
-    ref
-  )}`;
-}
-
+// ------------------------
+// Download helpers
+// ------------------------
 async function downloadToFile(url, destPath) {
   const res = await fetch(url, { redirect: "follow" });
   if (!res.ok) throw new Error(`Download failed ${res.status} from ${url}`);
 
   const len = Number(res.headers.get("content-length") || "0");
   if (len && len > MAX_LIB_BYTES) {
-    throw new Error(
-      `Download too large (${len} bytes) > limit ${MAX_LIB_BYTES}`
-    );
+    throw new Error(`Download too large (${len} bytes) > limit ${MAX_LIB_BYTES}`);
   }
 
   await fs.mkdir(path.dirname(destPath), { recursive: true });
   const fileStream = fsSync.createWriteStream(destPath);
 
   let total = 0;
-  if (!res.body) throw new Error("No response body");
+  const reader = res.body;
+  if (!reader) throw new Error("No response body");
 
-  const nodeReadable =
-    typeof Readable.fromWeb === "function" && typeof res.body.getReader === "function"
-      ? Readable.fromWeb(res.body)
-      : res.body;
+  await pipeline(
+    reader,
+    new Transform({
+      transform(chunk, _enc, cb) {
+        total += chunk.length;
+        if (total > MAX_LIB_BYTES) {
+          cb(new Error(`Download exceeded limit ${MAX_LIB_BYTES} bytes`));
+          return;
+        }
+        cb(null, chunk);
+      },
+    }),
+    fileStream
+  );
 
-  const limiter = new Transform({
-    transform(chunk, _enc, cb) {
-      total += chunk.length;
-      if (total > MAX_LIB_BYTES) {
-        cb(new Error(`Download exceeded limit ${MAX_LIB_BYTES} bytes`));
-        return;
-      }
-      cb(null, chunk);
-    },
-  });
-
-  await pipeline(nodeReadable, limiter, fileStream);
   return { bytes: total };
 }
 
@@ -235,146 +292,16 @@ async function sha256File(filePath) {
   return h.digest("hex");
 }
 
-async function listDirNames(p) {
-  try {
-    const entries = await fs.readdir(p, { withFileTypes: true });
-    return entries.map((e) => ({ name: e.name, isDir: e.isDirectory() }));
-  } catch {
-    return [];
-  }
-}
-
-async function safeRm(p) {
-  try {
-    await fs.rm(p, { recursive: true, force: true });
-  } catch {
-    // ignore
-  }
-}
-
-async function safeSymlink(target, linkPath) {
-  await safeRm(linkPath);
-  await fs.symlink(target, linkPath, "dir");
-}
-
-function existsSyncSafe(p) {
-  try {
-    return fsSync.existsSync(p);
-  } catch {
-    return false;
-  }
-}
-
 // ------------------------
-// LIVE status helpers (disk truth)
+// Enable/disable handling
 // ------------------------
-function getDiskStatus(id) {
-  const storePath = path.join(STORE_DIR, id);
-  const enabledLink = path.join(ENABLED_DIR, id);
-
-  const storeExists = existsSyncSafe(storePath);
-
-  let enabledLinkExists = false;
-  let enabledTarget = null;
-  let enabledTargetExists = false;
-
-  try {
-    if (existsSyncSafe(enabledLink)) {
-      enabledLinkExists = true;
-      // resolve symlink target (works even if target gone)
-      try {
-        const linkTarget = fsSync.readlinkSync(enabledLink);
-        enabledTarget = path.isAbsolute(linkTarget)
-          ? linkTarget
-          : path.resolve(path.dirname(enabledLink), linkTarget);
-      } catch {
-        enabledTarget = null;
-      }
-      enabledTargetExists = enabledTarget ? existsSyncSafe(enabledTarget) : false;
-    }
-  } catch {
-    enabledLinkExists = false;
+async function setLibraryEnabled(id, finalTarget, enabled) {
+  const linkPath = path.join(ENABLED_DIR, id);
+  if (enabled) {
+    await safeSymlink(finalTarget, linkPath);
+  } else {
+    await safeRm(linkPath);
   }
-
-  const render_enabled = enabledLinkExists && enabledTargetExists;
-  const render_installed = storeExists || enabledTargetExists;
-
-  return {
-    storePath,
-    enabledLink,
-    storeExists,
-    enabledLinkExists,
-    enabledTarget,
-    enabledTargetExists,
-    render_enabled,
-    render_installed,
-  };
-}
-
-function buildLiveLibraryRecord(id) {
-  const dbRec = DB.libraries?.[id] || { id };
-  const disk = getDiskStatus(id);
-
-  return {
-    // DB fields (desired/configured)
-    id: dbRec.id ?? id,
-    url: dbRec.url ?? null,
-    usedUrl: dbRec.usedUrl ?? null,
-    ref: dbRec.ref ?? null,
-    version: dbRec.version ?? null,
-    rootFolder: dbRec.rootFolder ?? null,
-    sha256: dbRec.sha256 ?? null,
-    name: dbRec.name ?? null,
-    description: dbRec.description ?? null,
-    keywords: dbRec.keywords ?? null,
-
-    // What DB thinks is enabled (desired)
-    enabled: dbRec.enabled !== false,
-
-    // Errors/timestamps
-    installedAt: dbRec.installedAt ?? null,
-    updatedAt: dbRec.updatedAt ?? null,
-    lastError: dbRec.lastError ?? null,
-
-    // LIVE truth (what matters for your "Refresh Status" button)
-    render_enabled: disk.render_enabled,
-    render_installed: disk.render_installed,
-    disk: {
-      storeExists: disk.storeExists,
-      enabledLinkExists: disk.enabledLinkExists,
-      enabledTargetExists: disk.enabledTargetExists,
-      enabledTarget: disk.enabledTarget,
-    },
-  };
-}
-
-async function listLiveLibraries() {
-  const ids = new Set([
-    ...Object.keys(DB.libraries || {}),
-    ...(await (async () => {
-      try {
-        const entries = await fs.readdir(ENABLED_DIR);
-        return entries || [];
-      } catch {
-        return [];
-      }
-    })()),
-    ...(await (async () => {
-      try {
-        const entries = await fs.readdir(STORE_DIR);
-        return entries || [];
-      } catch {
-        return [];
-      }
-    })()),
-  ]);
-
-  const out = {};
-  for (const id of ids) {
-    if (!id) continue;
-    out[id] = buildLiveLibraryRecord(id);
-  }
-  return out;
 }
 
 // ------------------------
@@ -385,29 +312,21 @@ async function installOneLibrary(lib) {
   if (!id) throw new Error("Missing library id");
 
   const ref = String(lib.ref || "master").trim();
-  const url = String(lib.url || "").trim();
+  const wantEnabled = lib.enabled !== false;
+
+  let url = String(lib.url || "").trim();
   if (!url) throw new Error(`Library ${id}: missing url`);
 
   let usedUrl = url;
-
-  const zipTar = githubZipToCodeloadTar(url);
-  if (zipTar) {
-    usedUrl = zipTar;
-  } else if (looksLikeGithubRepo(url)) {
+  if (looksLikeGithubRepo(url)) {
     const u = githubCodeload(url, ref);
     usedUrl = u.heads;
-  } else {
-    if (usedUrl.endsWith(".zip")) {
-      throw new Error(
-        `Library ${id}: .zip URLs are not supported unless it's a GitHub archive URL. Use https://github.com/OWNER/REPO or a .tar.gz URL.`
-      );
-    }
   }
 
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), `lib-${id}-`));
   const tgzPath = path.join(tmpDir, "lib.tar.gz");
 
-  pushLog("library.download.start", `Downloading ${id}`, { usedUrl, ref });
+  pushLog("library.download.start", `Downloading ${id}`, { id, usedUrl, ref });
 
   let downloaded;
   try {
@@ -424,18 +343,14 @@ async function installOneLibrary(lib) {
 
   const sha = await sha256File(tgzPath);
   if (lib.sha256 && String(lib.sha256).trim() && String(lib.sha256).trim() !== sha) {
-    throw new Error(
-      `Library ${id}: sha256 mismatch (expected ${lib.sha256}, got ${sha})`
-    );
+    throw new Error(`Library ${id}: sha256 mismatch (expected ${lib.sha256}, got ${sha})`);
   }
 
   const storePath = path.join(STORE_DIR, id);
   await safeRm(storePath);
   await fs.mkdir(storePath, { recursive: true });
 
-  await execFileAsync("tar", ["-xzf", tgzPath, "-C", storePath], {
-    timeout: 180000,
-  });
+  await execFileAsync("tar", ["-xzf", tgzPath, "-C", storePath], { timeout: 180000 });
 
   const entries = await listDirNames(storePath);
   const dirs = entries.filter((e) => e.isDir).map((e) => e.name);
@@ -446,10 +361,11 @@ async function installOneLibrary(lib) {
 
   if (desiredRootFolder) {
     const candidate = path.join(storePath, desiredRootFolder);
-    if (existsSyncSafe(candidate) && fsSync.statSync(candidate).isDirectory()) {
+    if (fsSync.existsSync(candidate) && fsSync.statSync(candidate).isDirectory()) {
       finalTarget = candidate;
     } else {
       pushLog("library.rootFolder.warn", `rootFolder not found for ${id}, falling back`, {
+        id,
         desiredRootFolder,
         topFolder,
       });
@@ -459,17 +375,7 @@ async function installOneLibrary(lib) {
     if (topFolder) finalTarget = path.join(storePath, topFolder);
   }
 
-  const enabled = lib.enabled !== false;
-  const enabledLink = path.join(ENABLED_DIR, id);
-  if (enabled) {
-    await safeSymlink(finalTarget, enabledLink);
-  } else {
-    await safeRm(enabledLink);
-  }
-
-  const rel = path.relative(storePath, finalTarget);
-  const actualRootFolder =
-    rel && rel !== "" && !rel.startsWith("..") ? rel : null;
+  await setLibraryEnabled(id, finalTarget, wantEnabled);
 
   const rec = {
     id,
@@ -477,9 +383,9 @@ async function installOneLibrary(lib) {
     usedUrl,
     ref,
     version: lib.version ?? null,
-    rootFolder: desiredRootFolder || actualRootFolder || topFolder || null,
+    rootFolder: desiredRootFolder || topFolder || null,
     sha256: sha,
-    enabled,
+    enabled: wantEnabled,
     name: lib.name ?? null,
     description: lib.description ?? null,
     keywords: lib.keywords ?? null,
@@ -491,18 +397,15 @@ async function installOneLibrary(lib) {
   DB.libraries[id] = { ...(DB.libraries[id] || {}), ...rec };
 
   pushLog("library.install.ok", `Installed ${id}`, {
+    id,
     bytes: downloaded?.bytes,
     sha256: sha,
-    enabled,
-    linkedTo: enabled ? finalTarget : "(disabled)",
+    enabled: wantEnabled,
+    linkedTo: wantEnabled ? finalTarget : "(disabled)",
   });
 
   await saveDb(DB);
-
-  // cleanup temp dir
-  try {
-    await safeRm(tmpDir);
-  } catch {}
+  broadcastLibraries(DB);
 
   return rec;
 }
@@ -514,11 +417,10 @@ async function applyLibraries(payload, { disableMissing = false } = {}) {
   const desiredIds = new Set();
 
   for (const l of libs) {
-    try {
-      const id = String(l.id || "").trim();
-      if (!id) throw new Error("Library missing id");
-      desiredIds.add(id);
+    const id = String(l?.id || "").trim();
+    if (id) desiredIds.add(id);
 
+    try {
       const rec = await installOneLibrary(l);
       results.push(rec);
     } catch (e) {
@@ -537,12 +439,12 @@ async function applyLibraries(payload, { disableMissing = false } = {}) {
           updatedAt: nowIso(),
           lastError: err,
         };
+        await safeRm(path.join(ENABLED_DIR, lid));
       }
 
-      pushLog("library.install.err", "Install failed", {
-        id: l?.id || null,
-        error: err,
-      });
+      pushLog("library.install.err", `Install failed`, { id: l?.id || null, error: err });
+      await saveDb(DB);
+      broadcastLibraries(DB);
     }
   }
 
@@ -554,14 +456,30 @@ async function applyLibraries(payload, { disableMissing = false } = {}) {
         await safeRm(path.join(ENABLED_DIR, id));
       }
     }
+    await saveDb(DB);
+    broadcastLibraries(DB);
   }
 
-  await saveDb(DB);
   return { installed: results, errors };
 }
 
+async function deleteLibrary(id) {
+  const libId = String(id || "").trim();
+  if (!libId) throw new Error("Missing id");
+  pushLog("library.delete.start", `Deleting ${libId}`, { id: libId });
+
+  // remove enabled link + store content + DB record
+  await safeRm(path.join(ENABLED_DIR, libId));
+  await safeRm(path.join(STORE_DIR, libId));
+  delete DB.libraries[libId];
+
+  await saveDb(DB);
+  pushLog("library.delete.ok", `Deleted ${libId}`, { id: libId });
+  broadcastLibraries(DB);
+}
+
 // ------------------------
-// Auto-sync (no disk -> recover after restarts automatically)
+// Auto-sync
 // ------------------------
 async function autoSyncOnce() {
   if (!AUTOSYNC_URL) return;
@@ -575,7 +493,7 @@ async function autoSyncOnce() {
     const manifest = await res.json();
 
     const libraries = Array.isArray(manifest) ? manifest : manifest?.libraries;
-    if (!Array.isArray(libraries)) throw new Error("Manifest invalid: expected libraries[]");
+    if (!Array.isArray(libraries)) throw new Error(`Manifest invalid: expected libraries[]`);
 
     pushLog("autosync.apply", "Applying manifest", { count: libraries.length });
     await applyLibraries({ libraries }, { disableMissing: true });
@@ -592,7 +510,6 @@ app.get("/health", (_req, res) => res.status(200).send("ok"));
 
 app.post("/render", async (req, res) => {
   try {
-    // Always protect render unless TOKEN is empty
     if (!authOk(req)) return res.status(401).json({ error: "Unauthorized" });
 
     const { code, format } = req.body || {};
@@ -603,9 +520,7 @@ app.post("/render", async (req, res) => {
       return res.status(400).json({ error: "Only format=stl is supported" });
     }
 
-    pushLog("render.start", "Render requested", {
-      bytes: Buffer.byteLength(code, "utf8"),
-    });
+    pushLog("render.start", "Render requested", { bytes: Buffer.byteLength(code, "utf8") });
 
     const jobId = crypto.randomBytes(6).toString("hex");
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), `scad-${jobId}-`));
@@ -614,10 +529,7 @@ app.post("/render", async (req, res) => {
 
     await fs.writeFile(inFile, code, "utf8");
 
-    const env = {
-      ...process.env,
-      OPENSCADPATH: ENABLED_DIR,
-    };
+    const env = { ...process.env, OPENSCADPATH: ENABLED_DIR };
 
     try {
       await execFileAsync("openscad", ["-o", outFile, inFile], {
@@ -625,14 +537,11 @@ app.post("/render", async (req, res) => {
         env,
       });
     } catch (e) {
-      const stdout = e?.stdout || "";
       const stderr = e?.stderr || e?.message || "";
-      pushLog("render.err", "Render failed", {
-        error: String(stderr || stdout || e?.message || e),
-      });
+      pushLog("render.err", "Render failed", { error: String(stderr) });
       return res.status(500).json({
         error: "OpenSCAD render failed",
-        details: String(stderr || stdout || e?.message || e),
+        details: String(stderr),
       });
     }
 
@@ -664,11 +573,13 @@ app.post("/libraries/sync", requireAuth, async (req, res) => {
     errors: errors.length,
   });
 
+  broadcastLibraries(DB);
   return res.json({ ok: errors.length === 0, installed, errors, db: DB });
 });
 
 app.post("/libraries/apply", requireAuth, async (req, res) => {
   const disableMissing = req.body?.disableMissing !== false;
+
   pushLog("apply.start", "Library apply request", {
     librariesCount: Array.isArray(req.body?.libraries) ? req.body.libraries.length : 0,
     disableMissing,
@@ -682,98 +593,74 @@ app.post("/libraries/apply", requireAuth, async (req, res) => {
     errors: errors.length,
   });
 
+  broadcastLibraries(DB);
   return res.json({ ok: errors.length === 0, installed, errors, db: DB });
 });
 
-// ------------------------
-// STATUS ENDPOINTS (what your Admin "Refresh Status" should read)
-// ------------------------
+// NEW: delete library fully from render (store + enabled symlink + DB)
+app.post("/libraries/delete", requireAuth, async (req, res) => {
+  try {
+    const id = String(req.body?.id || "").trim();
+    if (!id) return res.status(400).json({ ok: false, error: "Missing id" });
 
-// Live map of ALL libs known by DB or present on disk
-app.get("/api/libraries", requireStatusAuth, async (_req, res) => {
-  res.setHeader("Cache-Control", "no-store");
-  const libraries = await listLiveLibraries();
-  return res.json({
-    ok: true,
-    ts: nowIso(),
-    libraries,
-  });
+    if (!DB.libraries[id]) {
+      // If not present, still ensure folders are gone (idempotent)
+      await safeRm(path.join(ENABLED_DIR, id));
+      await safeRm(path.join(STORE_DIR, id));
+      return res.json({ ok: true, deleted: id, existed: false, db: DB });
+    }
+
+    await deleteLibrary(id);
+    return res.json({ ok: true, deleted: id, existed: true, db: DB });
+  } catch (e) {
+    pushLog("library.delete.err", "Delete failed", { error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
 });
 
-// Compare helper: send expected IDs, get missing/extra + statuses
-app.post("/api/libraries/status", requireStatusAuth, async (req, res) => {
+// Status (structured logs + db)
+app.get("/api/status", requireAuth, async (_req, res) => {
   res.setHeader("Cache-Control", "no-store");
-
-  const expectedIdsRaw =
-    req.body?.expectedIds ||
-    req.body?.ids ||
-    (Array.isArray(req.body?.libraries) ? req.body.libraries.map((x) => x?.id) : []);
-
-  const expectedIds = (Array.isArray(expectedIdsRaw) ? expectedIdsRaw : [])
-    .map((x) => String(x || "").trim())
-    .filter(Boolean);
-
-  const live = await listLiveLibraries();
-  const liveIds = Object.keys(live);
-
-  const expectedSet = new Set(expectedIds);
-  const liveSet = new Set(liveIds);
-
-  const missingIds = expectedIds.filter((id) => !liveSet.has(id));
-  const extraIds = liveIds.filter((id) => !expectedSet.has(id));
-
-  // statuses only for expected ids (common use)
-  const statuses = {};
-  for (const id of expectedIds) statuses[id] = live[id] || { id, render_installed: false, render_enabled: false };
-
   return res.json({
     ok: true,
-    ts: nowIso(),
-    expectedCount: expectedIds.length,
-    liveCount: liveIds.length,
-    missingIds,
-    extraIds,
-    statuses,
-  });
-});
-
-// Keep original status endpoint, but include live libraries too
-app.get("/api/status", requireStatusAuth, async (_req, res) => {
-  res.setHeader("Cache-Control", "no-store");
-  const libraries = await listLiveLibraries();
-  return res.json({
-    ok: true,
-    db: DB,        // raw/intended
-    libraries,     // LIVE truth (use this for your Refresh Status)
-    logs,
+    db: DB,
+    logs: logEntries, // structured
     env: {
       port: Number(process.env.PORT || 3000),
       LIB_ROOT,
       ENABLED_DIR,
       DB_PATH,
       AUTOSYNC_URL: AUTOSYNC_URL ? "(set)" : "",
-      STATUS_PUBLIC,
     },
   });
 });
 
+// Libraries-only endpoint (for your Admin “Refresh Status”)
+app.get("/api/libraries", requireAuth, async (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  return res.json({ ok: true, libraries: DB.libraries });
+});
+
 // SSE stream (EventSource can't send headers -> accept ?token=)
-app.get("/api/stream", requireStatusAuth, async (req, res) => {
-  if (!STATUS_PUBLIC && !authOk(req)) return res.status(401).send("Unauthorized");
+app.get("/api/stream", async (req, res) => {
+  if (!authOk(req)) return res.status(401).send("Unauthorized");
 
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders?.();
 
-  res.write(`event: hello\ndata: ${JSON.stringify({ ok: true })}\n\n`);
-  sseClients.add(res);
+  res.write(`event: hello\ndata: ${JSON.stringify({ ok: true, at: nowIso() })}\n\n`);
+  res.write(
+    `event: libraries\ndata: ${JSON.stringify({ libraries: DB.libraries, at: nowIso() })}\n\n`
+  );
 
+  sseClients.add(res);
   req.on("close", () => sseClients.delete(res));
 });
 
 // ------------------------
-// Dashboard (token remembered)
+// Dashboard UI
 // ------------------------
 function dashboardHtml() {
   return `<!doctype html>
@@ -784,24 +671,62 @@ function dashboardHtml() {
   <title>OpenSCAD Render Service — Library Monitor</title>
   <style>
     :root { color-scheme: dark; }
-    body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system; background: radial-gradient(1200px 800px at 20% 10%, #1b1b4a 0%, #07071a 55%, #050515 100%); color:#eaeaf2; }
+    body {
+      margin:0;
+      font-family: ui-sans-serif, system-ui, -apple-system;
+      background: radial-gradient(1200px 800px at 20% 10%, #1b1b4a 0%, #07071a 55%, #050515 100%);
+      color:#eaeaf2;
+    }
     .wrap { max-width: 1100px; margin: 0 auto; padding: 22px; }
     .top { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
     h1 { font-size: 22px; margin:0; letter-spacing:.2px; }
     .sub { margin-top:6px; color:#a8a8c7; font-size: 13px; }
     .row { display:flex; gap:16px; margin-top:18px; }
     @media (max-width: 900px) { .row { flex-direction: column; } }
-    .card { background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.10); border-radius: 16px; padding: 14px; box-shadow: 0 10px 40px rgba(0,0,0,0.35); }
+    .card {
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.10);
+      border-radius: 16px;
+      padding: 14px;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.35);
+    }
     .left { flex: 1; min-height: 520px; }
     .right { width: 440px; }
     @media (max-width: 900px) { .right { width: auto; } }
-    .pill { display:inline-flex; align-items:center; gap:8px; padding: 6px 10px; border-radius: 999px; font-size: 12px; background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.10); }
-    .btn { cursor:pointer; padding: 8px 12px; border-radius: 10px; border:1px solid rgba(255,255,255,0.14); background: rgba(255,255,255,0.08); color:#fff; }
+    .pill {
+      display:inline-flex; align-items:center; gap:8px;
+      padding: 6px 10px; border-radius: 999px; font-size: 12px;
+      background: rgba(255,255,255,0.07);
+      border: 1px solid rgba(255,255,255,0.10);
+      white-space: nowrap;
+    }
+    .btn {
+      cursor:pointer;
+      padding: 8px 12px; border-radius: 10px;
+      border:1px solid rgba(255,255,255,0.14);
+      background: rgba(255,255,255,0.08);
+      color:#fff;
+      white-space: nowrap;
+    }
     .btn.primary { background: linear-gradient(135deg,#7c3aed,#a855f7); border: none; }
-    .toolbar { display:flex; align-items:center; gap:10px; }
-    input[type="text"], input[type="password"] { width:100%; padding: 10px 12px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.14); background: rgba(0,0,0,0.25); color:#fff; outline:none; }
+    .btn:disabled { opacity:.5; cursor:not-allowed; }
+    .toolbar { display:flex; align-items:center; gap:10px; flex-wrap: wrap; }
+    input[type="text"], input[type="password"] {
+      width:100%;
+      box-sizing: border-box;
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,0.14);
+      background: rgba(0,0,0,0.25);
+      color:#fff;
+      outline:none;
+    }
     .grid { display:grid; grid-template-columns: 1fr; gap: 12px; margin-top: 12px; }
-    .lib { padding: 12px; border-radius: 14px; background: rgba(0,0,0,0.18); border: 1px solid rgba(255,255,255,0.10); }
+    .lib {
+      padding: 12px; border-radius: 14px;
+      background: rgba(0,0,0,0.18);
+      border: 1px solid rgba(255,255,255,0.10);
+    }
     .libTop { display:flex; align-items:center; justify-content:space-between; gap:10px; }
     .libId { font-weight: 700; letter-spacing:.3px; }
     .tag { font-size: 11px; padding: 4px 8px; border-radius: 999px; }
@@ -809,10 +734,57 @@ function dashboardHtml() {
     .tag.off { background: rgba(148,163,184,.14); border:1px solid rgba(148,163,184,.30); color:#cbd5e1; }
     .muted { color:#b7b7d6; font-size: 12px; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
-    .logbox { height: 520px; overflow:auto; background: rgba(0,0,0,0.28); border:1px solid rgba(255,255,255,0.12); border-radius: 14px; padding: 10px; }
-    .login { position: fixed; inset: 0; display:none; align-items:center; justify-content:center; background: rgba(0,0,0,0.55); }
-    .login .panel { width: 420px; max-width: calc(100% - 28px); }
+    .logbox {
+      height: 520px; overflow:auto;
+      background: rgba(0,0,0,0.28);
+      border:1px solid rgba(255,255,255,0.12);
+      border-radius: 14px;
+      padding: 10px;
+    }
+    .logRow { padding: 8px 8px; border-bottom: 1px solid rgba(255,255,255,0.08); }
+    .logLine { white-space: pre-wrap; word-break: break-word; }
+    .logExplain { margin-top: 4px; font-size: 11px; }
+    .logExplain.info { color: #86efac; }   /* green */
+    .logExplain.warn { color: #fde047; }   /* yellow */
+    .logExplain.error { color: #fca5a5; }  /* red */
     .hr { height:1px; background: rgba(255,255,255,0.10); margin: 10px 0; }
+
+    /* Mobile-friendly token modal */
+    .login {
+      position: fixed; inset: 0;
+      display:none; align-items:center; justify-content:center;
+      background: rgba(0,0,0,0.55);
+      padding: 14px;
+      box-sizing: border-box;
+    }
+    .login .panel {
+      width: min(420px, calc(100vw - 28px));
+      max-width: 100%;
+    }
+    .login .panel .rowBtns { display:flex; gap:10px; margin-top: 12px; flex-wrap: wrap; }
+    .login .panel .rowBtns .btn { flex: 1 1 140px; }
+
+    .iconBtn {
+      display:inline-flex; align-items:center; justify-content:center;
+      width: 34px; height: 34px;
+      border-radius: 10px;
+      border:1px solid rgba(255,255,255,0.14);
+      background: rgba(255,255,255,0.08);
+      cursor:pointer;
+    }
+    .iconBtn.danger:hover { border-color: rgba(239,68,68,0.55); }
+    .iconBtn svg { width: 16px; height: 16px; opacity: .95; }
+    .filters { display:flex; gap:8px; flex-wrap: wrap; }
+    .chip {
+      cursor:pointer;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border:1px solid rgba(255,255,255,0.14);
+      background: rgba(255,255,255,0.08);
+      font-size: 12px;
+      user-select: none;
+    }
+    .chip.active { background: rgba(124,58,237,0.35); border-color: rgba(124,58,237,0.55); }
   </style>
 </head>
 <body>
@@ -820,7 +792,7 @@ function dashboardHtml() {
     <div class="top">
       <div>
         <h1>OpenSCAD Render Service — Library Monitor</h1>
-        <div class="sub">Live view of installed/enabled libraries + sync/render logs.</div>
+        <div class="sub">Live view of installed/enabled libraries + sync/render logs. (Free Render: libs re-download after restarts)</div>
       </div>
       <div class="toolbar">
         <span class="pill" id="live">Live: connecting…</span>
@@ -831,16 +803,23 @@ function dashboardHtml() {
 
     <div class="row">
       <div class="card left">
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
-          <input id="search" type="text" placeholder="Search libraries…"/>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px; flex-wrap: wrap;">
+          <div style="flex: 1 1 260px;">
+            <input id="search" type="text" placeholder="Search libraries…"/>
+          </div>
           <div class="muted" id="count">0 libraries</div>
         </div>
         <div class="grid" id="libs"></div>
       </div>
 
       <div class="card right">
-        <div style="display:flex;align-items:center;justify-content:space-between;">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px; flex-wrap: wrap;">
           <div style="font-weight:700;">Live Logs <span class="muted">(updates on POSTs)</span></div>
+          <div class="filters">
+            <div class="chip active" data-mode="both" id="modeBoth">Both</div>
+            <div class="chip" data-mode="raw" id="modeRaw">Raw</div>
+            <div class="chip" data-mode="explain" id="modeExplain">Explain</div>
+          </div>
         </div>
         <div class="hr"></div>
         <div class="logbox mono" id="logbox"></div>
@@ -851,15 +830,15 @@ function dashboardHtml() {
   <div class="login" id="login">
     <div class="card panel">
       <div style="font-weight:800;font-size:18px;">Enter Render Token</div>
-      <div class="muted" style="margin-top:6px;">Stored in your browser (localStorage). You won’t be asked again (unless iframe storage is blocked).</div>
+      <div class="muted" style="margin-top:6px;">Stored in your browser (localStorage). You won’t be asked again.</div>
       <div style="margin-top:12px;">
         <input id="tokenInput" type="password" placeholder="Paste OPENSCAD_RENDER_TOKEN"/>
       </div>
-      <div style="display:flex;gap:10px;margin-top:12px;">
+      <div class="rowBtns">
         <button class="btn primary" id="saveToken">Save</button>
         <button class="btn" id="cancelToken">Cancel</button>
       </div>
-      <div class="muted" style="margin-top:10px;">Tip: open <span class="mono">/?token=YOUR_TOKEN</span> once to set cookie.</div>
+      <div class="muted" style="margin-top:10px;">Tip: you can also open <span class="mono">/?token=YOUR_TOKEN</span> once.</div>
     </div>
   </div>
 
@@ -897,30 +876,56 @@ function dashboardHtml() {
   };
   document.getElementById('refresh').onclick = () => boot();
 
+  // Log view mode
+  let logMode = 'both';
+  const modeBoth = document.getElementById('modeBoth');
+  const modeRaw = document.getElementById('modeRaw');
+  const modeExplain = document.getElementById('modeExplain');
+  function setMode(m) {
+    logMode = m;
+    modeBoth.classList.toggle('active', m === 'both');
+    modeRaw.classList.toggle('active', m === 'raw');
+    modeExplain.classList.toggle('active', m === 'explain');
+    // re-render from cache
+    renderLogsFromCache();
+  }
+  modeBoth.onclick = () => setMode('both');
+  modeRaw.onclick = () => setMode('raw');
+  modeExplain.onclick = () => setMode('explain');
+
   const logbox = document.getElementById('logbox');
   const libsEl = document.getElementById('libs');
   const countEl = document.getElementById('count');
   const liveEl = document.getElementById('live');
   const searchEl = document.getElementById('search');
 
-  let statusCache = null;
+  let statusCache = { db: { libraries: {} }, logs: [] };
+  let es = null;
 
-  function appendLog(line) {
-    const atBottom = (logbox.scrollTop + logbox.clientHeight) >= (logbox.scrollHeight - 12);
-    const div = document.createElement('div');
-    div.textContent = line;
-    logbox.appendChild(div);
-    while (logbox.childNodes.length > 600) logbox.removeChild(logbox.firstChild);
-    if (atBottom) logbox.scrollTop = logbox.scrollHeight;
+  function trashIconSvg() {
+    return \`
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M3 6h18"></path>
+        <path d="M8 6V4h8v2"></path>
+        <path d="M19 6l-1 14H6L5 6"></path>
+        <path d="M10 11v6"></path>
+        <path d="M14 11v6"></path>
+      </svg>\`;
   }
 
   function renderLibraries() {
     const q = (searchEl.value || '').toLowerCase();
-    const libs = (statusCache?.libraries) || (statusCache?.db?.libraries) || {};
-    const list = Object.values(libs)
-      .filter(x => !q || (x.id || '').toLowerCase().includes(q) || (x.url||'').toLowerCase().includes(q) || (x.usedUrl||'').toLowerCase().includes(q));
+    const libs = (statusCache?.db?.libraries) || {};
+    const all = Object.values(libs);
+    const list = all.filter(x =>
+      !q ||
+      (x.id || '').toLowerCase().includes(q) ||
+      (x.url || '').toLowerCase().includes(q) ||
+      (x.usedUrl || '').toLowerCase().includes(q)
+    );
 
-    countEl.textContent = list.length + ' of ' + Object.keys(libs).length + ' libraries';
+    countEl.textContent = list.length + ' of ' + all.length + ' libraries';
     libsEl.innerHTML = '';
 
     if (!list.length) {
@@ -934,21 +939,124 @@ function dashboardHtml() {
     for (const lib of list.sort((a,b) => (a.id||'').localeCompare(b.id||''))) {
       const box = document.createElement('div');
       box.className = 'lib';
-      const enabled = !!lib.render_enabled; // LIVE
-      box.innerHTML = \`
-        <div class="libTop">
-          <div class="libId">\${lib.id || '(no id)'}</div>
-          <span class="tag \${enabled ? 'on' : 'off'}">\${enabled ? 'Installed+Enabled' : (lib.render_installed ? 'Installed (disabled)' : 'Not installed')}</span>
-        </div>
-        <div class="muted" style="margin-top:6px;word-break:break-all;">\${lib.usedUrl || lib.url || ''}</div>
-        <div class="muted" style="margin-top:6px;">Last Sync: \${lib.updatedAt ? new Date(lib.updatedAt).toLocaleString() : '—'}</div>
-        \${lib.lastError ? '<div class="muted" style="margin-top:6px;color:#fca5a5;">Error: ' + lib.lastError + '</div>' : ''}
-      \`;
+
+      const top = document.createElement('div');
+      top.className = 'libTop';
+
+      const left = document.createElement('div');
+      left.style.display = 'flex';
+      left.style.alignItems = 'center';
+      left.style.gap = '10px';
+
+      const idEl = document.createElement('div');
+      idEl.className = 'libId';
+      idEl.textContent = lib.id || '(no id)';
+
+      const tag = document.createElement('span');
+      tag.className = 'tag ' + (lib.enabled ? 'on' : 'off');
+      tag.textContent = lib.enabled ? 'Enabled' : 'Disabled';
+
+      left.appendChild(idEl);
+      left.appendChild(tag);
+
+      const right = document.createElement('div');
+      right.style.display = 'flex';
+      right.style.alignItems = 'center';
+      right.style.gap = '8px';
+
+      // Delete button (always available)
+      const delBtn = document.createElement('button');
+      delBtn.className = 'iconBtn danger';
+      delBtn.title = 'Delete library from server';
+      delBtn.innerHTML = trashIconSvg();
+      delBtn.onclick = async (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+
+        const ok = confirm(\`Delete "\${lib.id}" from render server?\\n\\nThis removes it from the server UI + storage.\`);
+        if (!ok) return;
+
+        try {
+          delBtn.disabled = true;
+          await deleteLibraryFromServer(lib.id);
+        } finally {
+          delBtn.disabled = false;
+        }
+      };
+
+      right.appendChild(delBtn);
+
+      top.appendChild(left);
+      top.appendChild(right);
+
+      const urlEl = document.createElement('div');
+      urlEl.className = 'muted';
+      urlEl.style.marginTop = '6px';
+      urlEl.style.wordBreak = 'break-all';
+      urlEl.textContent = lib.usedUrl || lib.url || '';
+
+      const timeEl = document.createElement('div');
+      timeEl.className = 'muted';
+      timeEl.style.marginTop = '6px';
+      timeEl.textContent = 'Last Sync: ' + (lib.updatedAt ? new Date(lib.updatedAt).toLocaleString() : '—');
+
+      box.appendChild(top);
+      box.appendChild(urlEl);
+      box.appendChild(timeEl);
+
+      if (lib.lastError) {
+        const errEl = document.createElement('div');
+        errEl.className = 'muted';
+        errEl.style.marginTop = '6px';
+        errEl.style.color = '#fca5a5';
+        errEl.textContent = 'Error: ' + lib.lastError;
+        box.appendChild(errEl);
+      }
+
       libsEl.appendChild(box);
     }
   }
 
   searchEl.addEventListener('input', () => renderLibraries());
+
+  function clearLogbox() {
+    logbox.innerHTML = '';
+  }
+
+  function renderOneLog(entry) {
+    const row = document.createElement('div');
+    row.className = 'logRow';
+
+    // raw line
+    if (logMode === 'raw' || logMode === 'both') {
+      const line = document.createElement('div');
+      line.className = 'logLine';
+      line.textContent = entry.line || '';
+      row.appendChild(line);
+    }
+
+    // explanation
+    if (logMode === 'explain' || logMode === 'both') {
+      const ex = document.createElement('div');
+      ex.className = 'logExplain ' + (entry.level || 'info');
+      ex.textContent = entry.explain || '';
+      row.appendChild(ex);
+    }
+
+    return row;
+  }
+
+  function appendLog(entry) {
+    const atBottom = (logbox.scrollTop + logbox.clientHeight) >= (logbox.scrollHeight - 12);
+    logbox.appendChild(renderOneLog(entry));
+    while (logbox.childNodes.length > 800) logbox.removeChild(logbox.firstChild);
+    if (atBottom) logbox.scrollTop = logbox.scrollHeight;
+  }
+
+  function renderLogsFromCache() {
+    clearLogbox();
+    for (const e of (statusCache.logs || [])) appendLog(e);
+  }
 
   async function fetchStatus() {
     const t = getToken();
@@ -959,48 +1067,94 @@ function dashboardHtml() {
     return await r.json();
   }
 
+  async function deleteLibraryFromServer(id) {
+    const t = getToken();
+    const r = await fetch('/libraries/delete', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(t ? { 'Authorization': 'Bearer ' + t } : {})
+      },
+      body: JSON.stringify({ id })
+    });
+
+    if (r.status === 401) throw new Error('unauthorized');
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || 'Delete failed');
+
+    // If SSE is connected, it will also update, but do a quick local update too:
+    statusCache.db = data.db || statusCache.db;
+    renderLibraries();
+  }
+
   function connectSSE() {
     const t = getToken();
-    try {
-      const url = t ? ('/api/stream?token=' + encodeURIComponent(t)) : '/api/stream';
-      const es = new EventSource(url);
-      liveEl.textContent = 'Live: connecting…';
+    if (!t) return;
 
-      es.addEventListener('hello', () => {
-        liveEl.textContent = 'Live: connected';
-      });
+    try { if (es) es.close(); } catch {}
+    es = new EventSource('/api/stream?token=' + encodeURIComponent(t));
+    liveEl.textContent = 'Live: connecting…';
 
-      es.addEventListener('log', (ev) => {
-        try {
-          const data = JSON.parse(ev.data);
-          appendLog(data.line);
-        } catch {}
-      });
+    es.addEventListener('hello', () => {
+      liveEl.textContent = 'Live: connected';
+    });
 
-      es.onerror = () => {
-        liveEl.textContent = 'Live: disconnected';
-      };
-    } catch {
+    es.addEventListener('log', (ev) => {
+      try {
+        const entry = JSON.parse(ev.data);
+        // keep a small cache
+        statusCache.logs = statusCache.logs || [];
+        statusCache.logs.push(entry);
+        while (statusCache.logs.length > 800) statusCache.logs.shift();
+        appendLog(entry);
+      } catch {}
+    });
+
+    es.addEventListener('libraries', (ev) => {
+      try {
+        const data = JSON.parse(ev.data);
+        statusCache.db.libraries = data.libraries || {};
+        renderLibraries();
+      } catch {}
+    });
+
+    es.onerror = () => {
       liveEl.textContent = 'Live: disconnected';
-    }
+    };
   }
 
   async function boot() {
     const t = getToken();
-    if (!t && ${TOKEN ? "true" : "false"} && ${STATUS_PUBLIC ? "false" : "true"}) { showLogin(); return; }
+    const tokenRequired = ${TOKEN ? "true" : "false"};
+    if (!t && tokenRequired) { showLogin(); return; }
     hideLogin();
 
     try {
-      statusCache = await fetchStatus();
-      logbox.innerHTML = '';
-      (statusCache.logs || []).forEach(appendLog);
+      const s = await fetchStatus();
+      statusCache = s || statusCache;
+
+      renderLogsFromCache();
       renderLibraries();
+
       connectSSE();
+      liveEl.textContent = 'Live: connected';
     } catch (e) {
       if (String(e.message).includes('unauthorized')) {
         showLogin();
       } else {
-        appendLog(new Date().toISOString() + ' [ui.err] ' + (e.message || String(e)));
+        // synthesize a UI error entry
+        const entry = {
+          ts: new Date().toISOString(),
+          tag: 'ui.err',
+          msg: e.message || String(e),
+          data: null,
+          level: 'error',
+          explain: 'Dashboard error while loading status.',
+          line: new Date().toISOString() + ' [ui.err] ' + (e.message || String(e)),
+        };
+        statusCache.logs = statusCache.logs || [];
+        statusCache.logs.push(entry);
+        renderLogsFromCache();
       }
     }
   }
@@ -1011,8 +1165,9 @@ function dashboardHtml() {
 </html>`;
 }
 
-// Serve UI
+// Always serve UI; it will ask for token once (stored in browser)
 app.get("/", async (req, res) => {
+  // If they provided ?token= and it matches, set a cookie too (nice-to-have)
   if (TOKEN && typeof req.query.token === "string" && req.query.token === TOKEN) {
     res.setHeader(
       "Set-Cookie",
@@ -1036,11 +1191,12 @@ async function main() {
     LIB_ROOT,
     ENABLED_DIR,
     DB_PATH,
-    STATUS_PUBLIC,
   });
 
+  // Auto-sync on boot (critical for free instances)
   await autoSyncOnce();
 
+  // Periodic auto-sync while awake
   if (AUTOSYNC_URL) {
     setInterval(() => autoSyncOnce().catch(() => {}), AUTOSYNC_INTERVAL_MS).unref?.();
   }
